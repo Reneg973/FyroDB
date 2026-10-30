@@ -5,6 +5,7 @@ use crate::storage::{
 use foldhash::{HashMap, HashMapExt, HashSetExt};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::time::Duration;

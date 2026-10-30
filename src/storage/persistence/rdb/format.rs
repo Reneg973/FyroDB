@@ -25,12 +25,7 @@ pub(super) const CLUSTER_VERSION: u8 = 1;
 
 #[inline]
 pub(super) fn fsync_file(f: &File) -> io::Result<()> {
-   let ret = unsafe { libc::fsync(f.as_raw_fd()) };
-   if ret == 0 {
-      Ok(())
-   } else {
-      Err(io::Error::last_os_error())
-   }
+   f.sync_all()
 }
 
 #[inline]
