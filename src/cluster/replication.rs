@@ -19,11 +19,11 @@ pub struct MutationRecord {
    pub kind: MutationKind,
    pub key: Vec<u8>,
    pub value: Vec<u8>,
-   pub expire_at_ms: Option<u64>,
+   pub expire_at_ms: Option<std::num::NonZeroU64>,
 }
 
 impl MutationRecord {
-   pub fn replace(slot: Slot, key: Vec<u8>, value: Vec<u8>, expire_at_ms: Option<u64>) -> Self {
+   pub fn replace(slot: Slot, key: Vec<u8>, value: Vec<u8>, expire_at_ms: Option<std::num::NonZeroU64>) -> Self {
       Self {
          offset: 0,
          slot,
@@ -328,7 +328,7 @@ fn write_journal_entry(journal: &mut ReplicationJournal, record: &MutationRecord
    prefix[14] = record.kind as u8;
    prefix[15..19].copy_from_slice(&(record.key.len() as u32).to_be_bytes());
    prefix[19..23].copy_from_slice(&(record.value.len() as u32).to_be_bytes());
-   prefix[23..31].copy_from_slice(&record.expire_at_ms.unwrap_or(0).to_be_bytes());
+   prefix[23..31].copy_from_slice(&record.expire_at_ms.map_or(0, std::num::NonZeroU64::get).to_be_bytes());
    let mut slices = [
       std::io::IoSlice::new(&prefix),
       std::io::IoSlice::new(&record.key),
@@ -600,7 +600,7 @@ pub fn encode_mutation_to_buf(
    out.push(record.kind as u8);
    out.extend_from_slice(&(record.key.len() as u32).to_be_bytes());
    out.extend_from_slice(&(record.value.len() as u32).to_be_bytes());
-   out.extend_from_slice(&record.expire_at_ms.unwrap_or(0).to_be_bytes());
+   out.extend_from_slice(&record.expire_at_ms.map_or(0, std::num::NonZeroU64::get).to_be_bytes());
    out.extend_from_slice(&record.key);
    out.extend_from_slice(&record.value);
    Ok(())
@@ -705,7 +705,7 @@ pub fn decode_mutation(mut input: &[u8]) -> Result<MutationRecord, ReplicationCo
       kind,
       key,
       value,
-      expire_at_ms: (expire != 0).then_some(expire),
+      expire_at_ms: std::num::NonZeroU64::new(expire),
    })
 }
 
@@ -729,7 +729,7 @@ mod tests {
          kind: MutationKind::Set,
          key: b"key".to_vec(),
          value: b"value".to_vec(),
-         expire_at_ms: Some(123),
+         expire_at_ms: std::num::NonZeroU64::new(123),
       };
       let bytes = encode_mutation(&record).unwrap();
       assert_eq!(decode_mutation(&bytes).unwrap(), record);
@@ -785,7 +785,7 @@ mod tests {
          kind: MutationKind::Replace,
          key: b"key".to_vec(),
          value: b"value".to_vec(),
-         expire_at_ms: Some(123),
+         expire_at_ms: std::num::NonZeroU64::new(123),
       };
       let expected = {
          let coordinator = ReplicationCoordinator::new(16);
@@ -815,7 +815,7 @@ mod tests {
       assert_eq!(replayed[0].slot, Slot(42));
       assert_eq!(replayed[0].key, b"key");
       assert_eq!(replayed[0].value, b"value");
-      assert_eq!(replayed[0].expire_at_ms, Some(123));
+      assert_eq!(replayed[0].expire_at_ms, std::num::NonZeroU64::new(123));
       let _ = std::fs::remove_file(path);
    }
 
@@ -893,7 +893,7 @@ mod tests {
             kind: MutationKind::Delete,
             key: b"k".to_vec(),
             value: Vec::new(),
-            expire_at_ms: None
+            expire_at_ms: None,
          }))),
          Err(StreamError::NotStarted)
       );

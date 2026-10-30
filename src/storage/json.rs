@@ -50,7 +50,7 @@ impl Store {
             let mut root = JsonValue::Object(Vec::new());
             if root.set_path(path, parsed.clone()) {
                val.value.set_json(root);
-               val.expires_ms = 0;
+               val.expires_ms = None;
                Ok(true)
             } else {
                Err("ERR path does not exist")

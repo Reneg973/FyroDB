@@ -46,7 +46,7 @@ impl Store {
                out.extend_from_slice(if added { b":1\r\n" } else { b":0\r\n" });
             }
             val.value = FyroDB::ZSet(Box::new(z));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(());
          }
          match val.value.as_zset_mut() {
@@ -74,7 +74,7 @@ impl Store {
                key,
                StoreValue {
                   value: FyroDB::ZSet(Box::new(z)),
-                  expires_ms: 0,
+                  expires_ms: None,
                },
             );
             Ok(())
@@ -108,7 +108,7 @@ impl Store {
                flags.push(z.insert(*s, m));
             }
             val.value = FyroDB::ZSet(Box::new(z));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(flags);
          }
          match val.value.as_zset_mut() {
@@ -136,7 +136,7 @@ impl Store {
                key,
                StoreValue {
                   value: FyroDB::ZSet(Box::new(z)),
-                  expires_ms: 0,
+                  expires_ms: None,
                },
             );
             Ok(flags)
@@ -176,7 +176,7 @@ impl Store {
                }
             }
             val.value = FyroDB::ZSet(Box::new(z));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(added);
          }
          match val.value.as_zset_mut() {
@@ -395,7 +395,7 @@ impl Store {
             let mut z = ZSetData::new();
             z.insert(increment, member);
             val.value = FyroDB::ZSet(Box::new(z));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(increment);
          }
          match val.value.as_zset_mut() {

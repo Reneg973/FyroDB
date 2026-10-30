@@ -131,7 +131,7 @@ impl Store {
             }
             let encoded = encode_hll(&hll);
             val.value = FyroDB::String(SmallStr::from_string(encoded));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(changed);
          }
          match val.value.as_string_mut() {
@@ -198,7 +198,7 @@ impl Store {
             val.value = FyroDB::String(SmallStr::from_string(unsafe {
                String::from_utf8_unchecked(encoded)
             }));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(flags);
          }
          match val.value.as_string_mut() {

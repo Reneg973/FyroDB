@@ -33,11 +33,11 @@ impl Store {
          if val.is_expired() {
             return None;
          }
-         let was_persistent = val.expires_ms == 0;
-         val.expires_ms = now_ms() + duration.as_millis() as u64;
+         let was_persistent = val.expires_ms.is_none();
+         val.expires_ms = std::num::NonZeroU64::new(now_ms() + duration.as_millis() as u64);
          Some((was_persistent, val.expires_ms))
       });
-      let Some((was_persistent, expires_ms)) = result.flatten() else {
+      let Some((was_persistent, expire_at_ms)) = result.flatten() else {
          return false;
       };
       if was_persistent {
@@ -51,7 +51,7 @@ impl Store {
             kind: crate::cluster::MutationKind::Expire,
             key: key.as_bytes().to_vec(),
             value: Vec::new(),
-            expire_at_ms: Some(expires_ms),
+            expire_at_ms,
          });
       }
       was_persistent
@@ -64,8 +64,8 @@ impl Store {
             if val.is_expired() {
                return false;
             }
-            let was_persistent = val.expires_ms == 0;
-            val.expires_ms = abs_ms;
+            let was_persistent = val.expires_ms.is_none();
+            val.expires_ms = std::num::NonZeroU64::new(abs_ms);
             was_persistent
          })
          .unwrap_or(false);
@@ -79,7 +79,7 @@ impl Store {
                kind: crate::cluster::MutationKind::Expire,
                key: key.as_bytes().to_vec(),
                value: Vec::new(),
-               expire_at_ms: Some(abs_ms),
+               expire_at_ms: std::num::NonZeroU64::new(abs_ms),
             });
          }
       }
@@ -90,10 +90,10 @@ impl Store {
       let ok = self
          .data
          .update_with(key, |val| {
-            if val.is_expired() || val.expires_ms == 0 {
+            if val.is_expired() || val.expires_ms.is_none() {
                return false;
             }
-            val.expires_ms = 0;
+            val.expires_ms = None;
             true
          })
          .unwrap_or(false);

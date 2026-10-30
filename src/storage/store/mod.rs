@@ -323,7 +323,7 @@ mod tests {
       let slot = crate::cluster::hash_slot(key);
       let expiring = StoreValue {
          value: crate::storage::value::FyroDB::String(crate::storage::value::SmallStr::new("one")),
-         expires_ms: u64::MAX,
+         expires_ms: Some(std::num::NonZeroU64::MAX)
       };
       let persistent = StoreValue::string("two".to_owned());
 

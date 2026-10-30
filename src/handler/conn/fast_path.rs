@@ -221,7 +221,7 @@ pub(super) fn dispatch_get_run(conn: &mut Conn<'_>, first_key: (*const u8, usize
          let expected = ((hashes[i] as u32 as u64) << 32) | customhash::STATE_OCCUPIED;
          if (state & customhash::STATE_MATCH_MASK) == expected && e.key.eq_bytes(keys[i]) {
             let val = unsafe { (*e.value.get()).assume_init_ref() };
-            if val.expires_ms == 0 || !val.is_expired() {
+            if !val.is_expired() {
                if let crate::storage::value::FyroDB::String(s) = &val.value {
                   s.write_resp(out);
                   continue;
@@ -351,7 +351,7 @@ pub(super) fn dispatch_set_run(
                   Ok(_) => {
                      conn.store.data.snap_before_write(e);
                      let val = unsafe { (*e.value.get()).assume_init_mut() };
-                     val.expires_ms = 0;
+                     val.expires_ms = None;
                      if let crate::storage::value::FyroDB::String(ref mut s) = val.value {
                         s.overwrite_bytes(val_bytes);
                      } else {

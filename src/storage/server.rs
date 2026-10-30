@@ -15,9 +15,9 @@ impl Store {
       let generation = self.ttl_generation();
       let mut live_ttls = 0usize;
       self.data.retain(|_, entry| {
-         if entry.expires_ms == 0 {
+         if entry.expires_ms.is_none() {
             true
-         } else if entry.expires_ms > now {
+         } else if let Some(expires_ms) = entry.expires_ms && expires_ms.get() > now {
             live_ttls += 1;
             true
          } else {
@@ -42,7 +42,7 @@ impl Store {
          self
             .data
             .expire_shard_range(shard, start_slot, max_slots, |entry| {
-               (entry.expires_ms != 0).then_some(entry.expires_ms <= now)
+               entry.expires_ms.and_then(|expires_ms| Some(expires_ms.get() <= now))
             })
       else {
          return (0, start_slot, 0, 0);
