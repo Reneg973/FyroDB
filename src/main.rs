@@ -8,7 +8,7 @@ use fyro_db::{
 };
 use rust_zmalloc::Zmalloc;
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 #[global_allocator]
@@ -65,6 +65,41 @@ fn write_profile() {
    }
 }
 
+#[cfg(unix)]
+fn wait_for_shutdown_signal() {
+   unsafe {
+      let mut mask: libc::sigset_t = std::mem::zeroed();
+      libc::sigemptyset(&mut mask);
+      libc::sigaddset(&mut mask, libc::SIGTERM);
+      libc::sigaddset(&mut mask, libc::SIGINT);
+      libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+   }
+}
+
+#[cfg(windows)]
+fn wait_for_shutdown_signal() {
+   use std::sync::{Arc, Condvar, Mutex};
+
+   let state = Arc::new((Mutex::new(false), Condvar::new()));
+
+   {
+      let state = state.clone();
+      ctrlc::set_handler(move || {
+         let (lock, cv) = &*state;
+         *lock.lock().unwrap() = true;
+         cv.notify_one();
+      })
+          .unwrap();
+   }
+
+   let (lock, cv) = &*state;
+   let mut done = lock.lock().unwrap();
+
+   while !*done {
+      done = cv.wait(done).unwrap();
+   }
+}
+
 fn main() {
    if env::var("FYRODB_NULL_STORE").is_ok_and(|v| v == "1" || v == "true" || v == "yes") {
       fyro_db::handler::conn::set_null_store(true);
@@ -80,13 +115,7 @@ fn main() {
    #[cfg(feature = "profiling")]
    start_profiler();
 
-   unsafe {
-      let mut mask: libc::sigset_t = std::mem::zeroed();
-      libc::sigemptyset(&mut mask);
-      libc::sigaddset(&mut mask, libc::SIGTERM);
-      libc::sigaddset(&mut mask, libc::SIGINT);
-      libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
-   }
+   wait_for_shutdown_signal();
 
    let workers = config.workers;
    let affinity = fyro_db::utils::affinity::from_env(workers);
@@ -568,25 +597,44 @@ fn expiry_loop(store: &Arc<Store>) {
 }
 
 fn signal_loop(store: &Arc<Store>, rdb_path: &str) {
-   let mut sig = 0i32;
-   unsafe {
-      let mut mask: libc::sigset_t = std::mem::zeroed();
-      libc::sigemptyset(&mut mask);
-      libc::sigaddset(&mut mask, libc::SIGTERM);
-      libc::sigaddset(&mut mask, libc::SIGINT);
-      libc::sigwait(&mask, &mut sig);
+   let shutdown = Arc::new((Mutex::new(false), Condvar::new()));
+
+   {
+      let shutdown = shutdown.clone();
+
+      ctrlc::set_handler(move || {
+         let (lock, cv) = &*shutdown;
+         *lock.lock().unwrap() = true;
+         cv.notify_one();
+      })
+          .unwrap();
    }
-   eprintln!("fyrodb: received signal {sig}, shutting down...");
+
+   {
+      let (lock, cv) = &*shutdown;
+      let mut stop = lock.lock().unwrap();
+
+      while !*stop {
+         stop = cv.wait(stop).unwrap();
+      }
+   }
+
+   eprintln!("fyrodb: shutdown requested, shutting down...");
+
    #[cfg(feature = "profiling")]
    let _ = std::thread::Builder::new()
-      .stack_size(64 << 20)
-      .spawn(write_profile)
-      .map(|h| h.join());
+       .stack_size(64 << 20)
+       .spawn(write_profile)
+       .map(|h| h.join());
+
    initiate_shutdown();
+
    std::thread::sleep(Duration::from_millis(100));
+
    if let Err(e) = rdb::save(store, rdb_path) {
       eprintln!("fyrodb: save failed: {e}");
    }
+
    eprintln!("fyrodb: shutdown complete");
    std::process::exit(0);
 }

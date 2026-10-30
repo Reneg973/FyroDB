@@ -408,11 +408,20 @@ impl ReplicationCoordinator {
       MAX_LOG_BYTES
    }
 
+   #[cfg(unix)]
    pub fn flush_journal(&self) {
       use std::os::unix::io::AsRawFd;
       if let Some(journal) = self.journal.lock().unwrap().as_mut() {
          let _ = journal.file.flush();
          unsafe { libc::fsync(journal.file.as_raw_fd()) };
+      }
+   }
+
+   #[cfg(windows)]
+   pub fn flush_journal(&self) {
+      if let Some(journal) = self.journal.lock().unwrap().as_mut() {
+         let _ = journal.file.flush();
+         let _ = journal.file.sync_all();
       }
    }
 

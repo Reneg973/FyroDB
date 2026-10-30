@@ -1,4 +1,6 @@
 use super::*;
+use std::io::Read;
+use std::slice;
 
 impl<'a> Conn<'a> {
    /// Parse between reads once this much unparsed input has accumulated, so a
@@ -7,15 +9,13 @@ impl<'a> Conn<'a> {
 
    #[inline]
    fn recv_raw(&self, ptr: *mut u8, len: usize) -> io::Result<usize> {
-      use std::os::fd::AsRawFd;
+      let buf = unsafe { slice::from_raw_parts_mut(ptr, len) };
+
       loop {
-         let n = unsafe { libc::recv(self.stream.as_raw_fd(), ptr.cast(), len, 0) };
-         if n >= 0 {
-            return Ok(n as usize);
-         }
-         let err = io::Error::last_os_error();
-         if err.kind() != io::ErrorKind::Interrupted {
-            return Err(err);
+         match (&self.stream).read(buf) {
+            Ok(n) => return Ok(n),
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
          }
       }
    }

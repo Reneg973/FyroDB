@@ -122,15 +122,13 @@ impl Pool {
    }
 
    fn pop(&self) -> Option<Job> {
-      if let Some(job) = self.tickets.pop() {
-         self.queued.fetch_sub(1, Ordering::AcqRel);
-         return Some(job);
-      }
-      if self.queued.load(Ordering::Acquire) == 0 {
-         return None;
-      }
-      let mut q = self.queues.lock().unwrap();
-      let job = q.high.pop_front().or_else(|| q.low.pop_front());
+      let job = self.tickets.pop().or_else(|| {
+         if self.queued.load(Ordering::Acquire) == 0 {
+            return None;
+         }
+         let mut q = self.queues.lock().unwrap();
+         q.high.pop_front().or_else(|| q.low.pop_front())
+      });
       if job.is_some() {
          self.queued.fetch_sub(1, Ordering::AcqRel);
       }
@@ -138,19 +136,19 @@ impl Pool {
    }
 
    fn push(&self, job: Job, low: bool) {
-      let sleepers = {
+      {
          let mut q = self.queues.lock().unwrap();
          if low {
             q.low.push_back(job);
          } else {
             q.high.push_back(job);
          }
-         self.queued.fetch_add(1, Ordering::AcqRel);
-         self.sleepers.load(Ordering::Relaxed)
-      };
-      if sleepers > 0 {
-         self.cv.notify_one();
       }
+
+      // just notify, prevent bookkeeping, also do the atomic outside the lock
+      self.queued.fetch_add(1, Ordering::Release);
+      // prevent condition, very cheap call to notify_one(), nothing happens if noone waits
+      self.cv.notify_one();
    }
 
    pub fn try_run_ticket(&self) -> bool {
