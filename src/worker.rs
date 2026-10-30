@@ -550,6 +550,7 @@ fn make_listener(port: u16, bind: &str, _worker_index: usize) -> Listener {
 fn make_tcp_listener(addr: SocketAddr) -> TcpListener {
    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
    socket.set_reuse_address(true).unwrap();
+   #[cfg(unix)]
    socket.set_reuse_port(true).unwrap();
    socket.set_nonblocking(true).unwrap();
    socket.bind(&addr.into()).unwrap();
