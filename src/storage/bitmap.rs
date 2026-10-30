@@ -13,7 +13,7 @@ impl Store {
                bytes[byte_idx] |= 1 << bit_idx;
             }
             val.value = FyroDB::String(SmallStr::from_bytes(bytes));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(0u8);
          }
          match val.value.as_string_mut() {

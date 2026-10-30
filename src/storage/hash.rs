@@ -15,7 +15,7 @@ impl Store {
             let mut h = HashInner::new();
             let flags: Vec<bool> = fields.iter().map(|(f, v)| h.insert_ref(f, v)).collect();
             val.value = FyroDB::Hash(Box::new(h));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(flags);
          }
          match val.value.as_hash_mut() {
@@ -33,7 +33,7 @@ impl Store {
                key,
                StoreValue {
                   value: FyroDB::Hash(Box::new(h)),
-                  expires_ms: 0,
+                  expires_ms: None,
                },
             );
             Ok(flags)
@@ -69,7 +69,7 @@ impl Store {
             let mut h = HashInner::with_capacity(fields.len());
             let added = insert_and_count(&mut h);
             val.value = FyroDB::Hash(Box::new(h));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(added);
          }
          match val.value.as_hash_mut() {
@@ -90,7 +90,7 @@ impl Store {
                key,
                StoreValue {
                   value: FyroDB::Hash(Box::new(h)),
-                  expires_ms: 0,
+                  expires_ms: None,
                },
             );
             Ok(added)
@@ -113,7 +113,7 @@ impl Store {
             let mut h = HashInner::with_capacity(fields.len());
             let added = insert_and_count(&mut h);
             val.value = FyroDB::Hash(Box::new(h));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(added);
          }
          match val.value.as_hash_mut() {
@@ -134,7 +134,7 @@ impl Store {
                key,
                StoreValue {
                   value: FyroDB::Hash(Box::new(h)),
-                  expires_ms: 0,
+                  expires_ms: None,
                },
             );
             Ok(added)
@@ -152,7 +152,7 @@ impl Store {
             let mut h = HashInner::new();
             let flags: Vec<bool> = fields.iter().map(|(f, v)| h.insert_bytes(f, v)).collect();
             val.value = FyroDB::Hash(Box::new(h));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(flags);
          }
          match val.value.as_hash_mut() {
@@ -170,7 +170,7 @@ impl Store {
                key,
                StoreValue {
                   value: FyroDB::Hash(Box::new(h)),
-                  expires_ms: 0,
+                  expires_ms: None,
                },
             );
             Ok(flags)
@@ -194,7 +194,7 @@ impl Store {
             let mut h = HashInner::with_capacity(chunks.len());
             let added = insert_and_count(&mut h);
             val.value = FyroDB::Hash(Box::new(h));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(added);
          }
          match val.value.as_hash_mut() {
@@ -215,7 +215,7 @@ impl Store {
                key,
                StoreValue {
                   value: FyroDB::Hash(Box::new(h)),
-                  expires_ms: 0,
+                  expires_ms: None,
                },
             );
             Ok(added)
@@ -238,7 +238,7 @@ impl Store {
             let mut h = HashInner::with_capacity(fields.len());
             let added = insert_and_count(&mut h);
             val.value = FyroDB::Hash(Box::new(h));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(added);
          }
          match val.value.as_hash_mut() {
@@ -259,7 +259,7 @@ impl Store {
                key,
                StoreValue {
                   value: FyroDB::Hash(Box::new(h)),
-                  expires_ms: 0,
+                  expires_ms: None,
                },
             );
             Ok(added)
@@ -273,7 +273,7 @@ impl Store {
             let mut h = HashInner::with_capacity(1);
             h.insert_ref(field, value);
             val.value = FyroDB::Hash(Box::new(h));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(true);
          }
          match val.value.as_hash_mut() {
@@ -298,7 +298,7 @@ impl Store {
                key,
                StoreValue {
                   value: FyroDB::Hash(Box::new(h)),
-                  expires_ms: 0,
+                  expires_ms: None,
                },
             );
             Ok(true)
@@ -595,7 +595,7 @@ impl Store {
                SmallStr::new(crate::storage::value::write_int_to(&mut nb, by)),
             ];
             val.value = FyroDB::Hash(Box::new(HashInner::Compact(v)));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(by);
          }
          match val.value.as_hash_mut() {
@@ -634,7 +634,7 @@ impl Store {
                key,
                StoreValue {
                   value: FyroDB::Hash(Box::new(HashInner::Compact(v))),
-                  expires_ms: 0,
+                  expires_ms: None,
                },
             ) {
                Ok(by)
@@ -650,7 +650,7 @@ impl Store {
          if val.is_expired() {
             let v = vec![SmallStr::new(field), SmallStr::new(&format_float(by))];
             val.value = FyroDB::Hash(Box::new(HashInner::Compact(v)));
-            val.expires_ms = 0;
+            val.expires_ms = None;
             return Ok(by);
          }
          match val.value.as_hash_mut() {
@@ -681,7 +681,7 @@ impl Store {
                key,
                StoreValue {
                   value: FyroDB::Hash(Box::new(HashInner::Compact(v))),
-                  expires_ms: 0,
+                  expires_ms: None,
                },
             );
             Ok(by)
@@ -715,7 +715,7 @@ mod missing_key_tests {
          "exp:h",
          crate::storage::value::StoreValue {
             value: crate::storage::value::FyroDB::Hash(Box::new(h)),
-            expires_ms: 1,
+            expires_ms: std::num::NonZeroU64::new(1),
          },
       );
       std::thread::sleep(std::time::Duration::from_millis(20));

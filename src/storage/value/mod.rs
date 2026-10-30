@@ -189,7 +189,7 @@ impl FyroDB {
 #[derive(Clone)]
 pub struct StoreValue {
    pub value: FyroDB,
-   pub expires_ms: u64,
+   pub expires_ms: Option<std::num::NonZeroU64>,
 }
 
 static UNIX_MS_CACHE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -266,7 +266,7 @@ impl StoreValue {
    pub fn string(s: String) -> Self {
       Self {
          value: FyroDB::String(SmallStr::from_string(s)),
-         expires_ms: 0,
+         expires_ms: None,
       }
    }
 
@@ -274,7 +274,7 @@ impl StoreValue {
    pub fn string_small(s: SmallStr) -> Self {
       Self {
          value: FyroDB::String(s),
-         expires_ms: 0,
+         expires_ms: None,
       }
    }
 
@@ -289,7 +289,7 @@ impl StoreValue {
       };
       Self {
          value: FyroDB::String(SmallStr::from_string(s)),
-         expires_ms,
+         expires_ms: std::num::NonZeroU64::new(expires_ms),
       }
    }
 
@@ -301,7 +301,7 @@ impl StoreValue {
          .collect();
       Self {
          value: FyroDB::Hash(Box::new(HashInner::Full(Box::new(h)))),
-         expires_ms: 0,
+         expires_ms: None,
       }
    }
 
@@ -309,7 +309,7 @@ impl StoreValue {
    pub fn list(l: VecDeque<String>) -> Self {
       Self {
          value: FyroDB::List(Box::new(ListValue::from_strs(l.iter().map(String::as_str)))),
-         expires_ms: 0,
+         expires_ms: None,
       }
    }
 
@@ -317,7 +317,7 @@ impl StoreValue {
    pub fn set(s: HashSet<String>) -> Self {
       Self {
          value: FyroDB::Set(Box::new(SetInner::from_strings(s))),
-         expires_ms: 0,
+         expires_ms: None,
       }
    }
 
@@ -325,7 +325,7 @@ impl StoreValue {
    pub fn zset(z: ZSetData) -> Self {
       Self {
          value: FyroDB::ZSet(Box::new(z)),
-         expires_ms: 0,
+         expires_ms: None,
       }
    }
 
@@ -333,7 +333,7 @@ impl StoreValue {
    pub fn json(j: JsonValue) -> Self {
       Self {
          value: FyroDB::Json(j.to_resp_string().into_boxed_str()),
-         expires_ms: 0,
+         expires_ms: None,
       }
    }
 
@@ -341,7 +341,7 @@ impl StoreValue {
    pub fn json_str(s: &str) -> Self {
       Self {
          value: FyroDB::Json(Box::from(s)),
-         expires_ms: 0,
+         expires_ms: None,
       }
    }
 
@@ -349,7 +349,7 @@ impl StoreValue {
    pub fn json_raw(s: String) -> Self {
       Self {
          value: FyroDB::Json(s.into_boxed_str()),
-         expires_ms: 0,
+         expires_ms: None,
       }
    }
 
@@ -357,37 +357,36 @@ impl StoreValue {
    pub fn stream(s: crate::storage::stream::StreamData) -> Self {
       Self {
          value: FyroDB::Stream(Box::new(s)),
-         expires_ms: 0,
+         expires_ms: None,
       }
    }
 
    #[inline(always)]
    pub fn is_expired(&self) -> bool {
-      self.expires_ms != 0 && approx_now_ms() >= self.expires_ms
+      self.expires_ms.is_some_and(|expires_ms| approx_now_ms() >= expires_ms.get())
    }
 
    /// Same test with a caller-supplied clock, so bulk scans pay one clock
    /// read instead of one per key.
    #[inline(always)]
    pub fn is_expired_at(&self, now_ms: u64) -> bool {
-      self.expires_ms != 0 && now_ms >= self.expires_ms
+      self.expires_ms.is_some_and(|expires_ms| now_ms >= expires_ms.get())
    }
 
    #[inline]
    pub fn is_expired_precise(&self) -> bool {
-      self.expires_ms != 0 && now_ms() >= self.expires_ms
+      self.expires_ms.is_some_and(|expires_ms| now_ms() >= expires_ms.get())
    }
 
    #[inline]
    pub fn ttl_ms(&self) -> Option<u64> {
-      if self.expires_ms == 0 {
-         return None;
-      }
+      let expires_ms = self.expires_ms?.get();
       let now = now_ms();
-      if now >= self.expires_ms {
+
+      if now >= expires_ms {
          None
       } else {
-         Some(self.expires_ms - now)
+         Some(expires_ms - now)
       }
    }
 }

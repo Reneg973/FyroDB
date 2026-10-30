@@ -71,7 +71,7 @@ pub fn set(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
          }
 
          current.value = crate::storage::value::FyroDB::String(SmallStr::new(value));
-         current.expires_ms = expires_ms;
+         current.expires_ms = std::num::NonZeroU64::new(expires_ms);
          (true, old_val)
       });
 
@@ -98,7 +98,7 @@ pub fn set(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
                key.to_string(),
                StoreValue {
                   value: crate::storage::value::FyroDB::String(SmallStr::new(value)),
-                  expires_ms,
+                  expires_ms: std::num::NonZeroU64::new(expires_ms),
                },
             );
             if get {
@@ -137,7 +137,7 @@ pub fn setex(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
    };
    let sv = StoreValue {
       value: crate::storage::value::FyroDB::String(SmallStr::new(value)),
-      expires_ms: exp,
+      expires_ms: std::num::NonZeroU64::new(exp),
    };
    match store.try_set_value(key.to_string(), sv) {
       Ok(_) => resp::write_ok(out),
@@ -158,7 +158,7 @@ pub fn psetex(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
    };
    let sv = StoreValue {
       value: crate::storage::value::FyroDB::String(SmallStr::new(value)),
-      expires_ms: exp,
+      expires_ms: std::num::NonZeroU64::new(exp),
    };
    match store.try_set_value(key.to_string(), sv) {
       Ok(_) => resp::write_ok(out),
@@ -251,7 +251,7 @@ pub fn msetnx(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
                value: crate::storage::value::FyroDB::String(
                   crate::storage::value::SmallStr::new(val),
                ),
-               expires_ms: 0,
+               expires_ms: None,
             };
             if !store.data.insert_if_absent_str(key, store_val) {
                failed_idx = Some(i);

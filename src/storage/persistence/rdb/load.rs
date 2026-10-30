@@ -124,7 +124,7 @@ fn load_with_policy(store: &Store, path: &str, strict: bool) -> io::Result<usize
             let val = read_bytes_bounded(&mut r)?;
             StoreValue {
                value: FyroDB::String(SmallStr::from_bytes(val)),
-               expires_ms: ttl_ms,
+               expires_ms: std::num::NonZeroU64::new(ttl_ms),
             }
          }
          TYPE_HASH => {
@@ -146,7 +146,7 @@ fn load_with_policy(store: &Store, path: &str, strict: bool) -> io::Result<usize
             }
             StoreValue {
                value: FyroDB::Hash(Box::new(HashInner::Full(Box::new(h)))),
-               expires_ms: ttl_ms,
+               expires_ms: std::num::NonZeroU64::new(ttl_ms),
             }
          }
          TYPE_LIST => {
@@ -163,7 +163,7 @@ fn load_with_policy(store: &Store, path: &str, strict: bool) -> io::Result<usize
             }
             StoreValue {
                value: FyroDB::List(Box::new(l)),
-               expires_ms: ttl_ms,
+               expires_ms: std::num::NonZeroU64::new(ttl_ms),
             }
          }
          TYPE_SET => {
@@ -180,7 +180,7 @@ fn load_with_policy(store: &Store, path: &str, strict: bool) -> io::Result<usize
             }
             StoreValue {
                value: FyroDB::Set(Box::new(SetInner::from_strings(s))),
-               expires_ms: ttl_ms,
+               expires_ms: std::num::NonZeroU64::new(ttl_ms),
             }
          }
          TYPE_ZSET => {
@@ -200,14 +200,14 @@ fn load_with_policy(store: &Store, path: &str, strict: bool) -> io::Result<usize
             }
             StoreValue {
                value: FyroDB::ZSet(Box::new(z)),
-               expires_ms: ttl_ms,
+               expires_ms: std::num::NonZeroU64::new(ttl_ms),
             }
          }
          TYPE_JSON => {
             let json_str = read_string_bounded(&mut r)?;
             StoreValue {
                value: FyroDB::Json(json_str.into_boxed_str()),
-               expires_ms: ttl_ms,
+               expires_ms: std::num::NonZeroU64::new(ttl_ms),
             }
          }
          TYPE_STREAM | TYPE_STREAM2 => {
@@ -218,7 +218,7 @@ fn load_with_policy(store: &Store, path: &str, strict: bool) -> io::Result<usize
             };
             StoreValue {
                value: FyroDB::Stream(Box::new(stream)),
-               expires_ms: ttl_ms,
+               expires_ms: std::num::NonZeroU64::new(ttl_ms),
             }
          }
          _ => {
@@ -229,7 +229,7 @@ fn load_with_policy(store: &Store, path: &str, strict: bool) -> io::Result<usize
          }
       };
 
-      if store_value.expires_ms != 0 {
+      if store_value.expires_ms.is_some() {
          store.add_ttl();
       }
       store.data.insert(key, store_value);
@@ -297,5 +297,8 @@ pub fn decode_single_value(bytes: &[u8]) -> io::Result<StoreValue> {
          "trailing value bytes",
       ));
    }
-   Ok(StoreValue { value, expires_ms })
+   Ok(StoreValue {
+      value,
+      expires_ms: std::num::NonZeroU64::new(expires_ms)
+   })
 }
