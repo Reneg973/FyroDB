@@ -2,6 +2,8 @@ mod common;
 use common::*;
 use fyro_db::storage::bitmap::BitOp;
 
+const SMALL_STR_CAP: u64 = 23;
+
 #[test]
 fn setbit_creates_key() {
    let s = store();
@@ -15,6 +17,9 @@ fn setbit_returns_old_value() {
    s.setbit("k", 7, true).unwrap();
    assert_eq!(s.setbit("k", 7, false), Ok(1));
    assert_eq!(s.getbit("k", 7), Ok(0));
+   s.setbit("k", SMALL_STR_CAP * 8 + 1, true).unwrap();
+   assert_eq!(s.setbit("k", SMALL_STR_CAP * 8 + 1, false), Ok(1));
+   assert_eq!(s.getbit("k", SMALL_STR_CAP * 8 + 1), Ok(0));
 }
 
 #[test]

@@ -265,7 +265,7 @@ fn saturate_signed(old: i64, incr: i64, bits: u32) -> i64 {
    let min = -(1i64 << (bits - 1));
    let max = (1i64 << (bits - 1)) - 1;
    let result = old.saturating_add(incr);
-   result.max(min).min(max)
+   result.clamp(min, max)
 }
 
 fn saturate_unsigned(old: i64, incr: i64, bits: u32) -> i64 {
@@ -275,5 +275,5 @@ fn saturate_unsigned(old: i64, incr: i64, bits: u32) -> i64 {
       (1i64 << bits) - 1
    };
    let result = old.saturating_add(incr);
-   result.max(0).min(max)
+   result.clamp(0, max)
 }
