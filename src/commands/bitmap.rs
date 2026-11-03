@@ -127,7 +127,7 @@ pub fn bitfield(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
          if bits == 0 || bits > 64 {
             return resp::write_err(out, "invalid bitfield type");
          }
-         let val = bf_get(store, key, offset, bits, signed);
+         let val = wt!(out, store.bf_get(key, offset, bits, signed));
          results.push(Some(val));
          i += 3;
       } else if rest[i].eq_ignore_ascii_case("SET") {
@@ -143,8 +143,8 @@ pub fn bitfield(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
          if bits == 0 || bits > 64 {
             return resp::write_err(out, "invalid bitfield type");
          }
-         let old = bf_get(store, key, offset, bits, signed);
-         bf_set(store, key, offset, bits, value);
+         let old = wt!(out, store.bf_get(key, offset, bits, signed));
+         wt!(out, store.bf_set(key, offset, bits, value));
          results.push(Some(old));
          i += 4;
       } else if rest[i].eq_ignore_ascii_case("INCRBY") {
@@ -160,7 +160,7 @@ pub fn bitfield(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
          if bits == 0 || bits > 64 {
             return resp::write_err(out, "invalid bitfield type");
          }
-         let old = bf_get(store, key, offset, bits, signed);
+         let old = wt!(out, store.bf_get(key, offset, bits, signed));
          let new_val = old.wrapping_add(increment);
          let clamped = if signed {
             clamp_signed(new_val, bits)
@@ -169,7 +169,7 @@ pub fn bitfield(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
          };
          match overflow {
             Overflow::Wrap => {
-               bf_set(store, key, offset, bits, clamped);
+               wt!(out, store.bf_set(key, offset, bits, clamped));
                results.push(Some(clamped));
             }
             Overflow::Sat => {
@@ -178,7 +178,7 @@ pub fn bitfield(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
                } else {
                   saturate_unsigned(old, increment, bits)
                };
-               bf_set(store, key, offset, bits, sat);
+               wt!(out, store.bf_set(key, offset, bits, sat));
                results.push(Some(sat));
             }
             Overflow::Fail => {
@@ -195,7 +195,7 @@ pub fn bitfield(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
                   new_val >= 0 && new_val <= max
                };
                if check {
-                  bf_set(store, key, offset, bits, new_val);
+                  wt!(out, store.bf_set(key, offset, bits, new_val));
                   results.push(Some(new_val));
                } else {
                   results.push(None);
@@ -239,27 +239,6 @@ fn parse_bitfield_offset(s: &str, bits: u32) -> u64 {
       stripped.parse::<u64>().unwrap_or(0) * bits as u64
    } else {
       s.parse::<u64>().unwrap_or(0)
-   }
-}
-
-fn bf_get(store: &Store, key: &str, offset: u64, bits: u32, signed: bool) -> i64 {
-   let mut val: u64 = 0;
-   for i in 0..bits {
-      let bit = store.getbit(key, offset + i as u64).unwrap_or(0);
-      val |= (bit as u64) << (bits - 1 - i);
-   }
-   if signed && bits < 64 && (val >> (bits - 1)) & 1 == 1 {
-      (val | (!0u64 << bits)) as i64
-   } else {
-      val as i64
-   }
-}
-
-fn bf_set(store: &Store, key: &str, offset: u64, bits: u32, value: i64) {
-   let val = value as u64;
-   for i in 0..bits {
-      let bit = (val >> (bits - 1 - i)) & 1 == 1;
-      let _ = store.setbit(key, offset + i as u64, bit);
    }
 }
 

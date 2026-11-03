@@ -294,6 +294,232 @@ impl Store {
          .insert_str(dest, StoreValue::string_small(SmallStr::from_bytes(result)));
       Ok(len)
    }
+
+   pub fn bf_get(
+      &self,
+      key: &str,
+      offset: u64,
+      bits: u32,
+      signed: bool,
+   ) -> Result<i64, &'static str> {
+      if bits == 0 {
+         return Ok(0);
+      }
+      if bits > 64 {
+         return Err("invalid bitfield type");
+      }
+      match self.data.get_ref(key) {
+         None => Ok(0),
+         Some(e) if e.is_expired() => Ok(0),
+         Some(e) => match e.value.as_string() {
+            Some(s) => {
+               let bytes = s.as_bytes();
+               let start_bit = offset;
+               let end_bit = offset + bits as u64;
+               let start_byte = (start_bit / 8) as usize;
+               let end_byte = end_bit.div_ceil(8) as usize;
+               let mut val: u64 = 0;
+
+               for b_idx in start_byte..end_byte {
+                  let byte_val = if b_idx < bytes.len() { bytes[b_idx] } else { 0 };
+                  let b_start = start_bit.max(b_idx as u64 * 8);
+                  let b_end = end_bit.min(b_idx as u64 * 8 + 8);
+                  let num_bits = (b_end - b_start) as u32;
+                  let shift_right = (b_idx as u64 * 8 + 8 - b_end) as u32;
+                  let mask = ((1u16 << num_bits) - 1) as u8;
+                  let extracted_bits = ((byte_val >> shift_right) & mask) as u64;
+                  let shift_left = (end_bit - b_end) as u32;
+                  val |= extracted_bits << shift_left;
+               }
+
+               if signed && bits < 64 && (val >> (bits - 1)) & 1 == 1 {
+                  Ok((val | (!0u64 << bits)) as i64)
+               } else {
+                  Ok(val as i64)
+               }
+            }
+            None => Err("WRONGTYPE"),
+         },
+      }
+   }
+
+   pub fn bf_set(&self, key: &str, offset: u64, bits: u32, value: i64) -> Result<(), &'static str> {
+      if bits == 0 {
+         return Ok(());
+      }
+      if bits > 64 {
+         return Err("invalid bitfield type");
+      }
+
+      let last_byte_idx = ((offset + bits as u64 - 1) / 8) as usize;
+      let val = value as u64;
+
+      let write_bits = |bytes: &mut [u8]| {
+         let start_bit = offset;
+         let end_bit = offset + bits as u64;
+         let start_byte = (start_bit / 8) as usize;
+         let end_byte = end_bit.div_ceil(8) as usize;
+
+         for (offset_idx, byte) in bytes[start_byte..end_byte].iter_mut().enumerate() {
+            let b_idx = start_byte + offset_idx;
+            let b_start = start_bit.max(b_idx as u64 * 8);
+            let b_end = end_bit.min(b_idx as u64 * 8 + 8);
+            let num_bits = (b_end - b_start) as u32;
+            let val_shift_right = (end_bit - b_end) as u32;
+            let bits_to_write =
+               ((val >> val_shift_right) & (((1u16 << num_bits) - 1) as u64)) as u8;
+            let byte_shift_left = (b_idx as u64 * 8 + 8 - b_end) as u32;
+            let shifted_bits = bits_to_write << byte_shift_left;
+            let mask = (((1u16 << num_bits) - 1) as u8) << byte_shift_left;
+            *byte = (*byte & !mask) | shifted_bits;
+         }
+      };
+
+      let result = self.data.update_with(key, |v| {
+         if v.is_expired() {
+            let mut bytes = vec![0u8; last_byte_idx + 1];
+            write_bits(&mut bytes);
+            v.value = FyroDB::String(SmallStr::from_bytes(bytes));
+            v.expires_ms = 0;
+            return Ok(());
+         }
+         match v.value.as_string_mut() {
+            Some(s) => {
+               s.ensure_len(last_byte_idx + 1);
+               let bytes = s.as_bytes_mut();
+               write_bits(bytes);
+               Ok(())
+            }
+            None => Err("WRONGTYPE"),
+         }
+      });
+
+      match result {
+         Some(r) => r,
+         None => {
+            let mut bytes = vec![0u8; last_byte_idx + 1];
+            write_bits(&mut bytes);
+            self.data.insert(
+               key.to_string(),
+               StoreValue::string_small(SmallStr::from_bytes(bytes)),
+            );
+            Ok(())
+         }
+      }
+   }
+
+   pub fn bf_get(
+      &self,
+      key: &str,
+      offset: u64,
+      bits: u32,
+      signed: bool,
+   ) -> Result<i64, &'static str> {
+      if bits == 0 {
+         return Ok(0);
+      }
+      if bits > 64 {
+         return Err("invalid bitfield type");
+      }
+      match self.data.get_ref(key) {
+         None => Ok(0),
+         Some(e) if e.is_expired() => Ok(0),
+         Some(e) => match e.value.as_string() {
+            Some(s) => {
+               let bytes = s.as_bytes();
+               let start_bit = offset;
+               let end_bit = offset + bits as u64;
+               let start_byte = (start_bit / 8) as usize;
+               let end_byte = end_bit.div_ceil(8) as usize;
+               let mut val: u64 = 0;
+
+               for b_idx in start_byte..end_byte {
+                  let byte_val = if b_idx < bytes.len() { bytes[b_idx] } else { 0 };
+                  let b_start = start_bit.max(b_idx as u64 * 8);
+                  let b_end = end_bit.min(b_idx as u64 * 8 + 8);
+                  let num_bits = (b_end - b_start) as u32;
+                  let shift_right = (b_idx as u64 * 8 + 8 - b_end) as u32;
+                  let mask = ((1u16 << num_bits) - 1) as u8;
+                  let extracted_bits = ((byte_val >> shift_right) & mask) as u64;
+                  let shift_left = (end_bit - b_end) as u32;
+                  val |= extracted_bits << shift_left;
+               }
+
+               if signed && bits < 64 && (val >> (bits - 1)) & 1 == 1 {
+                  Ok((val | (!0u64 << bits)) as i64)
+               } else {
+                  Ok(val as i64)
+               }
+            }
+            None => Err("WRONGTYPE"),
+         },
+      }
+   }
+
+   pub fn bf_set(&self, key: &str, offset: u64, bits: u32, value: i64) -> Result<(), &'static str> {
+      if bits == 0 {
+         return Ok(());
+      }
+      if bits > 64 {
+         return Err("invalid bitfield type");
+      }
+
+      let last_byte_idx = ((offset + bits as u64 - 1) / 8) as usize;
+      let val = value as u64;
+
+      let write_bits = |bytes: &mut [u8]| {
+         let start_bit = offset;
+         let end_bit = offset + bits as u64;
+         let start_byte = (start_bit / 8) as usize;
+         let end_byte = end_bit.div_ceil(8) as usize;
+
+         for (offset_idx, byte) in bytes[start_byte..end_byte].iter_mut().enumerate() {
+            let b_idx = start_byte + offset_idx;
+            let b_start = start_bit.max(b_idx as u64 * 8);
+            let b_end = end_bit.min(b_idx as u64 * 8 + 8);
+            let num_bits = (b_end - b_start) as u32;
+            let val_shift_right = (end_bit - b_end) as u32;
+            let bits_to_write =
+               ((val >> val_shift_right) & (((1u16 << num_bits) - 1) as u64)) as u8;
+            let byte_shift_left = (b_idx as u64 * 8 + 8 - b_end) as u32;
+            let shifted_bits = bits_to_write << byte_shift_left;
+            let mask = (((1u16 << num_bits) - 1) as u8) << byte_shift_left;
+            *byte = (*byte & !mask) | shifted_bits;
+         }
+      };
+
+      let result = self.data.update_with(key, |v| {
+         if v.is_expired() {
+            let mut bytes = vec![0u8; last_byte_idx + 1];
+            write_bits(&mut bytes);
+            v.value = FyroDB::String(SmallStr::from_bytes(bytes));
+            v.expires_ms = 0;
+            return Ok(());
+         }
+         match v.value.as_string_mut() {
+            Some(s) => {
+               s.ensure_len(last_byte_idx + 1);
+               let bytes = s.as_bytes_mut();
+               write_bits(bytes);
+               Ok(())
+            }
+            None => Err("WRONGTYPE"),
+         }
+      });
+
+      match result {
+         Some(r) => r,
+         None => {
+            let mut bytes = vec![0u8; last_byte_idx + 1];
+            write_bits(&mut bytes);
+            self.data.insert(
+               key.to_string(),
+               StoreValue::string_small(SmallStr::from_bytes(bytes)),
+            );
+            Ok(())
+         }
+      }
+   }
 }
 
 #[derive(Clone, Copy)]
