@@ -152,3 +152,120 @@ fn getbit_wrong_type() {
    s.sadd("k", &["member"]).unwrap();
    assert_eq!(s.getbit("k", 0), Err("WRONGTYPE"));
 }
+
+#[test]
+fn bf_get_missing_key() {
+   let s = store();
+   assert_eq!(s.bf_get("k", 0, 8, false), Ok(0));
+   assert_eq!(s.bf_get("k", 100, 16, true), Ok(0));
+}
+
+#[test]
+fn bf_set_and_get_basic() {
+   let s = store();
+   s.bf_set("k", 0, 8, 0xAB).unwrap();
+   assert_eq!(s.bf_get("k", 0, 8, false), Ok(0xAB));
+   // 0xAB = 10101011 in binary
+   assert_eq!(s.getbit("k", 0), Ok(1));
+   assert_eq!(s.getbit("k", 1), Ok(0));
+   assert_eq!(s.getbit("k", 2), Ok(1));
+   assert_eq!(s.getbit("k", 3), Ok(0));
+   assert_eq!(s.getbit("k", 4), Ok(1));
+   assert_eq!(s.getbit("k", 5), Ok(0));
+   assert_eq!(s.getbit("k", 6), Ok(1));
+   assert_eq!(s.getbit("k", 7), Ok(1));
+}
+
+#[test]
+fn bf_get_signed_sign_extension() {
+   let s = store();
+   s.bf_set("k", 0, 8, 0xFF).unwrap();
+   assert_eq!(s.bf_get("k", 0, 8, true), Ok(-1));
+   assert_eq!(s.bf_get("k", 0, 8, false), Ok(255));
+
+   s.bf_set("k", 8, 4, 0b1111).unwrap();
+   assert_eq!(s.bf_get("k", 8, 4, true), Ok(-1));
+   assert_eq!(s.bf_get("k", 8, 4, false), Ok(15));
+
+   s.bf_set("k", 12, 4, 0b0111).unwrap();
+   assert_eq!(s.bf_get("k", 12, 4, true), Ok(7));
+   assert_eq!(s.bf_get("k", 12, 4, false), Ok(7));
+}
+
+#[test]
+fn bf_set_and_get_unaligned() {
+   let s = store();
+   s.bf_set("k", 4, 8, 0xAB).unwrap();
+   assert_eq!(s.bf_get("k", 4, 8, false), Ok(0xAB));
+   assert_eq!(s.bf_get("k", 0, 4, false), Ok(0));
+
+   s.bf_set("k", 2, 13, 0x1ABC).unwrap();
+   assert_eq!(s.bf_get("k", 2, 13, false), Ok(0x1ABC));
+}
+
+#[test]
+fn bf_set_and_get_64bit() {
+   let s = store();
+   let val = 0x0123456789ABCDEF_i64;
+   s.bf_set("k", 0, 64, val).unwrap();
+   assert_eq!(s.bf_get("k", 0, 64, false), Ok(val));
+   assert_eq!(s.bf_get("k", 0, 64, true), Ok(val));
+
+   s.bf_set("k", 3, 64, -123456789012345678_i64).unwrap();
+   assert_eq!(s.bf_get("k", 3, 64, true), Ok(-123456789012345678_i64));
+}
+
+#[test]
+fn bf_set_and_get_single_bit() {
+   let s = store();
+   s.bf_set("k", 10, 1, 1).unwrap();
+   assert_eq!(s.bf_get("k", 10, 1, false), Ok(1));
+   assert_eq!(s.getbit("k", 10), Ok(1));
+
+   s.bf_set("k", 10, 1, 0).unwrap();
+   assert_eq!(s.bf_get("k", 10, 1, false), Ok(0));
+   assert_eq!(s.getbit("k", 10), Ok(0));
+}
+
+#[test]
+fn bf_wrong_type() {
+   let s = store();
+   s.sadd("k", &["member"]).unwrap();
+   assert_eq!(s.bf_get("k", 0, 8, false), Err("WRONGTYPE"));
+   assert_eq!(s.bf_set("k", 0, 8, 42), Err("WRONGTYPE"));
+}
+
+#[test]
+fn bf_edge_cases() {
+   let s = store();
+   assert_eq!(s.bf_get("k", 0, 0, false), Ok(0));
+   assert_eq!(s.bf_set("k", 0, 0, 123), Ok(()));
+   assert_eq!(s.bf_get("k", 0, 65, false), Err("invalid bitfield type"));
+   assert_eq!(s.bf_set("k", 0, 65, 123), Err("invalid bitfield type"));
+}
+
+#[test]
+fn bitfield_command_get_set_incrby() {
+   let s = store();
+   let mut out = Vec::new();
+   fyro_db::commands::bitmap::bitfield(&["BITFIELD", "k", "SET", "u8", "0", "200"], &s, &mut out);
+   assert_eq!(String::from_utf8_lossy(&out), "*1\r\n:0\r\n");
+
+   out.clear();
+   fyro_db::commands::bitmap::bitfield(&["BITFIELD", "k", "GET", "u8", "0"], &s, &mut out);
+   assert_eq!(String::from_utf8_lossy(&out), "*1\r\n:200\r\n");
+
+   out.clear();
+   fyro_db::commands::bitmap::bitfield(&["BITFIELD", "k", "INCRBY", "u8", "0", "10"], &s, &mut out);
+   assert_eq!(String::from_utf8_lossy(&out), "*1\r\n:210\r\n");
+
+   out.clear();
+   fyro_db::commands::bitmap::bitfield(
+      &[
+         "BITFIELD", "k", "OVERFLOW", "SAT", "INCRBY", "u8", "0", "100",
+      ],
+      &s,
+      &mut out,
+   );
+   assert_eq!(String::from_utf8_lossy(&out), "*1\r\n:255\r\n");
+}
