@@ -5,26 +5,28 @@ impl Store {
    pub fn setbit(&self, key: &str, offset: u64, value: bool) -> Result<u8, &'static str> {
       let byte_idx = (offset / 8) as usize;
       let bit_idx = 7 - (offset % 8) as u8;
+      let mask = (1 << bit_idx) as u8;
 
       let result = self.data.update_with(key, |val| {
-         if val.is_expired() {
-            let mut bytes = vec![0u8; byte_idx + 1];
-            if value {
-               bytes[byte_idx] |= 1 << bit_idx;
-            }
-            val.value = FyroDB::String(SmallStr::from_bytes(bytes));
-            val.expires_ms = 0;
-            return Ok(0u8);
-         }
+         let is_expired = val.is_expired();
          match val.value.as_string_mut() {
             Some(s) => {
                s.ensure_len(byte_idx + 1);
+               let mut old = 0u8;
                let bytes = s.as_bytes_mut();
-               let old = (bytes[byte_idx] >> bit_idx) & 1;
-               if value {
-                  bytes[byte_idx] |= 1 << bit_idx;
-               } else {
-                  bytes[byte_idx] &= !(1 << bit_idx);
+               if is_expired {
+                  bytes.fill(0);
+                  bytes[byte_idx] |= mask;
+                  val.expires_ms = 0;
+               }
+               else {
+                  let p = unsafe { bytes.get_unchecked_mut(byte_idx) };
+                  old = (*p >> bit_idx) & 1;
+                  if value {
+                     *p |= mask;
+                  } else {
+                     *p &= !mask;
+                  }
                }
                Ok(old)
             }
@@ -35,14 +37,26 @@ impl Store {
       match result {
          Some(r) => r,
          None => {
-            let mut bytes = vec![0u8; byte_idx + 1];
-            if value {
-               bytes[byte_idx] |= 1 << bit_idx;
+            if byte_idx < crate::storage::value::small_str::SMALL_STR_CAP {
+               let mut bytes = [0u8; crate::storage::value::small_str::SMALL_STR_CAP];
+               if value {
+                  bytes[byte_idx] |= mask;
+               }
+               self.data.insert_if_absent_str(
+                  key,
+                  StoreValue::string_small(SmallStr::from_slice(&bytes[..byte_idx + 1])),
+               );
             }
-            self.data.insert_str(
-               key,
-               StoreValue::string(unsafe { String::from_utf8_unchecked(bytes) }),
-            );
+            else {
+               let mut bytes = vec![0u8; byte_idx + 1];
+               if value {
+                  bytes[byte_idx] |= mask;
+               }
+               self.data.insert_if_absent_str(
+                  key,
+                  StoreValue::string(unsafe { String::from_utf8_unchecked(bytes) }),
+               );
+            }
             Ok(0)
          }
       }
@@ -144,19 +158,9 @@ impl Store {
       use_bit: bool,
    ) -> Result<i64, &'static str> {
       match self.data.get_ref(key) {
-         None => {
-            if bit == 0 {
-               Ok(0)
-            } else {
-               Ok(-1)
-            }
-         }
+         None => Ok(if bit == 0 { 0 } else { -1 }),
          Some(e) if e.is_expired() => {
-            if bit == 0 {
-               Ok(0)
-            } else {
-               Ok(-1)
-            }
+            Ok(if bit == 0 { 0 } else { -1 })
          }
          Some(e) => match e.value.as_string() {
             Some(s) => {
@@ -173,10 +177,7 @@ impl Store {
                   }
                   let s_byte = s_idx / 8;
                   let e_byte = e_idx / 8;
-                  for byte_i in s_byte..=e_byte {
-                     if byte_i >= bytes.len() {
-                        break;
-                     }
+                  for byte_i in s_byte..=e_byte.min(bytes.len() - 1) {
                      let lo = if byte_i == s_byte { s_idx % 8 } else { 0 };
                      let hi = if byte_i == e_byte { e_idx % 8 } else { 7 };
                      let mask = (0xFF_u8 >> lo) & (0xFF_u8 << (7 - hi));

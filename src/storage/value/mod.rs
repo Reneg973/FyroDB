@@ -2,7 +2,7 @@ mod collections;
 mod json_value;
 mod list;
 mod quicklist;
-mod small_str;
+pub(crate) mod small_str;
 mod zset_data;
 
 pub use collections::{HashInner, HashIter, SetInner, SetIter, SetMemberRef, canonical_i64};
@@ -392,7 +392,7 @@ impl StoreValue {
    }
 }
 
-const _: () = assert!(std::mem::size_of::<SmallStr>() == 24);
-const _: () = assert!(std::mem::size_of::<FyroDB>() == 24);
-const _: () = assert!(std::mem::size_of::<StoreValue>() == 32);
+const _: () = assert!(size_of::<SmallStr>() == 24);
+const _: () = assert!(size_of::<FyroDB>() == 24);
+const _: () = assert!(size_of::<StoreValue>() == 32);
 const _: () = assert!(customhash::entry_size::<StoreValue>() == 56);
