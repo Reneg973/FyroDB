@@ -1,9 +1,10 @@
 pub(crate) const SMALL_STR_CAP: usize = 23;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[repr(u8)]
 #[allow(dead_code)]
 pub(crate) enum Tag {
+   #[default]
    L0,
    L1,
    L2,
@@ -34,12 +35,13 @@ pub(crate) enum Tag {
 impl Tag {
    #[inline(always)]
    pub(crate) fn inline(n: usize) -> Tag {
-      debug_assert!(n <= 23);
+      debug_assert!(n <= Tag::L23 as usize);
       unsafe { std::mem::transmute::<u8, Tag>(n as u8) }
    }
 }
 
 #[repr(C)]
+#[derive(Default)]
 pub struct SmallStr {
    data: [u8; SMALL_STR_CAP],
    len: Tag,
@@ -104,16 +106,17 @@ const CRLF_U16: u16 = u16::from_ne_bytes(*b"\r\n");
 
 impl SmallStr {
    #[inline]
-   fn store_heap_len(data: &mut [u8; SMALL_STR_CAP], len: usize) {
+   fn store_heap_data(data: &mut [u8; SMALL_STR_CAP], ptr: *mut u8, len: usize) {
+      data[..8].copy_from_slice(&(ptr as usize).to_ne_bytes());
       let lb = (len as u64).to_le_bytes();
-      data[8..15].copy_from_slice(&lb[..7]);
+      data[8..16].copy_from_slice(&lb[..8]);
    }
 
    #[inline(always)]
    fn read_heap_len(data: &[u8; SMALL_STR_CAP]) -> usize {
       unsafe {
          let word = std::ptr::read_unaligned(data.as_ptr().add(8).cast::<u64>());
-         (word.to_le() & 0x00FF_FFFF_FFFF_FFFF) as usize
+         word.to_le() as usize
       }
    }
 
@@ -153,9 +156,7 @@ impl SmallStr {
       } else {
          let ptr = Box::into_raw(s.into_boxed_str());
          let mut data = [0u8; SMALL_STR_CAP];
-         let bytes = (ptr as *const u8 as usize).to_ne_bytes();
-         data[..8].copy_from_slice(&bytes);
-         Self::store_heap_len(&mut data, unsafe { &*ptr }.len());
+         Self::store_heap_data(&mut data, ptr as *mut u8, unsafe { &*ptr }.len());
          Self {
             data,
             len: Tag::Heap,
@@ -324,68 +325,6 @@ impl SmallStr {
 
    #[inline(always)]
    pub fn write_resp(&self, out: &mut Vec<u8>) {
-      let len = self.len as usize;
-      if len < 10 {
-         let old_len = out.len();
-         if old_len + 16 <= out.capacity() {
-            let total = 6 + len;
-            unsafe {
-               let p = out.as_mut_ptr().add(old_len);
-               let header = 0x0A0D_3024u32 | ((len as u32) << 8);
-               p.cast::<u32>().write_unaligned(header);
-               p.add(4)
-                  .cast::<u64>()
-                  .write_unaligned(self.data.as_ptr().cast::<u64>().read_unaligned());
-               if len == 9 {
-                  *p.add(12) = *self.data.as_ptr().add(8);
-               }
-               p.add(4 + len).cast::<u16>().write_unaligned(CRLF_U16);
-               out.set_len(old_len + total);
-            }
-            return;
-         }
-         crate::utils::resp::write_bulk_bytes(out, self.as_bytes());
-         return;
-      }
-      if len <= SMALL_STR_CAP {
-         let old_len = out.len();
-         let total = 7 + len;
-         if old_len + total <= out.capacity() {
-            unsafe {
-               let p = out.as_mut_ptr().add(old_len);
-               let (d1, d2) = if len >= 20 {
-                  (b'2', b'0' + (len - 20) as u8)
-               } else {
-                  (b'1', b'0' + (len - 10) as u8)
-               };
-               let header = 0x0D00_0024u32 | ((d1 as u32) << 8) | ((d2 as u32) << 16);
-               p.cast::<u32>().write_unaligned(header);
-               *p.add(4) = b'\n';
-
-               let src = self.data.as_ptr();
-               let dst = p.add(5);
-               if len >= 16 {
-                  let w1 = std::ptr::read_unaligned(src.cast::<u64>());
-                  let w2 = std::ptr::read_unaligned(src.add(8).cast::<u64>());
-                  let w3 = std::ptr::read_unaligned(src.add(len - 8).cast::<u64>());
-                  std::ptr::write_unaligned(dst.cast::<u64>(), w1);
-                  std::ptr::write_unaligned(dst.add(8).cast::<u64>(), w2);
-                  std::ptr::write_unaligned(dst.add(len - 8).cast::<u64>(), w3);
-               } else {
-                  let w1 = std::ptr::read_unaligned(src.cast::<u64>());
-                  let w2 = std::ptr::read_unaligned(src.add(len - 8).cast::<u64>());
-                  std::ptr::write_unaligned(dst.cast::<u64>(), w1);
-                  std::ptr::write_unaligned(dst.add(len - 8).cast::<u64>(), w2);
-               }
-
-               p.add(5 + len).cast::<u16>().write_unaligned(CRLF_U16);
-               out.set_len(old_len + total);
-            }
-            return;
-         }
-         crate::utils::resp::write_bulk_bytes(out, self.as_bytes());
-         return;
-      }
       crate::utils::resp::write_bulk_bytes(out, self.as_bytes());
    }
 
@@ -461,76 +400,33 @@ impl SmallStr {
 
    #[inline(always)]
    pub fn from_slice(bytes: &[u8]) -> Self {
-      let len = bytes.len();
-      if len <= SMALL_STR_CAP {
-         let mut data = [0u8; SMALL_STR_CAP];
+      let length = bytes.len();
+      let mut data = [0u8; SMALL_STR_CAP];
+      let mut len = Tag::Heap;
+      if length <= SMALL_STR_CAP {
          unsafe {
-            let src = bytes.as_ptr();
-            let dst = data.as_mut_ptr();
-            if len >= 16 {
-               let w1 = std::ptr::read_unaligned(src.cast::<u64>());
-               let w2 = std::ptr::read_unaligned(src.add(8).cast::<u64>());
-               let w3 = std::ptr::read_unaligned(src.add(len - 8).cast::<u64>());
-               std::ptr::write_unaligned(dst.cast::<u64>(), w1);
-               std::ptr::write_unaligned(dst.add(8).cast::<u64>(), w2);
-               std::ptr::write_unaligned(dst.add(len - 8).cast::<u64>(), w3);
-            } else if len >= 8 {
-               let w1 = std::ptr::read_unaligned(src.cast::<u64>());
-               let w2 = std::ptr::read_unaligned(src.add(len - 8).cast::<u64>());
-               std::ptr::write_unaligned(dst.cast::<u64>(), w1);
-               std::ptr::write_unaligned(dst.add(len - 8).cast::<u64>(), w2);
-            } else if len >= 4 {
-               let w1 = std::ptr::read_unaligned(src.cast::<u32>());
-               let w2 = std::ptr::read_unaligned(src.add(len - 4).cast::<u32>());
-               std::ptr::write_unaligned(dst.cast::<u32>(), w1);
-               std::ptr::write_unaligned(dst.add(len - 4).cast::<u32>(), w2);
-            } else if len == 1 {
-               *dst = *src;
-            } else if len == 2 {
-               std::ptr::write_unaligned(
-                  dst.cast::<u16>(),
-                  std::ptr::read_unaligned(src.cast::<u16>()),
-               );
-            } else if len == 3 {
-               std::ptr::write_unaligned(
-                  dst.cast::<u16>(),
-                  std::ptr::read_unaligned(src.cast::<u16>()),
-               );
-               *dst.add(2) = *src.add(2);
-            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), data.as_mut_ptr(), length);
          }
-         Self {
-            data,
-            len: Tag::inline(len),
-         }
+         len = Tag::inline(length);
       } else {
-         let len = bytes.len();
          let ptr = Box::into_raw(bytes.to_vec().into_boxed_slice()) as *mut u8;
-         let mut data = [0u8; SMALL_STR_CAP];
-         data[..8].copy_from_slice(&(ptr as usize).to_ne_bytes());
-         Self::store_heap_len(&mut data, len);
-         Self {
-            data,
-            len: Tag::Heap,
-         }
+         Self::store_heap_data(&mut data, ptr, length);
+      }
+      Self {
+         data,
+         len,
       }
    }
 
    #[inline]
    pub fn from_bytes(bytes: Vec<u8>) -> Self {
       if bytes.len() <= SMALL_STR_CAP {
-         let mut data = [0u8; SMALL_STR_CAP];
-         data[..bytes.len()].copy_from_slice(&bytes);
-         return Self {
-            data,
-            len: Tag::inline(bytes.len()),
-         };
+         return Self::from_slice(bytes.as_slice());
       }
       let len = bytes.len();
       let ptr = Box::into_raw(bytes.into_boxed_slice()) as *mut u8;
       let mut data = [0u8; SMALL_STR_CAP];
-      data[..8].copy_from_slice(&(ptr as usize).to_ne_bytes());
-      Self::store_heap_len(&mut data, len);
+      Self::store_heap_data(&mut data, ptr, len);
       Self {
          data,
          len: Tag::Heap,
@@ -539,18 +435,29 @@ impl SmallStr {
 
    #[inline]
    pub fn ensure_len(&mut self, min_len: usize) {
-      if self.len() < min_len {
-         if self.len != Tag::Heap && min_len <= SMALL_STR_CAP {
-            let current = self.len();
-            self.data[current..min_len].fill(0);
-            self.len = Tag::inline(min_len);
-            return;
-         }
-         let mut owned = Vec::with_capacity(min_len);
-         owned.extend_from_slice(self.as_bytes());
-         owned.resize(min_len, 0);
-         *self = Self::from_bytes(owned);
+      if self.len() >= min_len {
+         return;
       }
+      if self.len != Tag::Heap && min_len <= SMALL_STR_CAP {
+         let current = self.len();
+         self.data[current..min_len].fill(0);
+         self.len = Tag::inline(min_len);
+         return;
+      }
+      let mut owned = Vec::with_capacity(min_len);
+      owned.extend_from_slice(self.as_bytes());
+      owned.resize(min_len, 0);
+      *self = Self::from_bytes(owned);
+   }
+
+   pub fn with_capacity(size: usize) -> Self {
+      if size <= SMALL_STR_CAP {
+         return Self {
+            data: [0u8; SMALL_STR_CAP],
+            len: Tag::inline(size),
+         };
+      }
+      Self::from_bytes(vec![0u8; size])
    }
 }
 
@@ -589,15 +496,6 @@ impl std::ops::Deref for SmallStr {
    #[inline(always)]
    fn deref(&self) -> &str {
       self.as_str()
-   }
-}
-
-impl Default for SmallStr {
-   fn default() -> Self {
-      Self {
-         data: [0u8; SMALL_STR_CAP],
-         len: Tag::L0,
-      }
    }
 }
 

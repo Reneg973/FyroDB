@@ -1,5 +1,5 @@
 use crate::storage::store::Store;
-use crate::storage::value::{FyroDB, SmallStr, StoreValue};
+use crate::storage::value::{SmallStr, StoreValue};
 
 #[inline]
 pub fn count_ones_fast(slice: &[u8]) -> usize {
@@ -22,14 +22,13 @@ impl Store {
       let byte_idx = (offset / 8) as usize;
       let bit_idx = 7 - (offset % 8) as u8;
 
-      let result = self.data.update_with(key, |val| {
+      let do_update = |val: &mut StoreValue| {
          if val.is_expired() {
             let mut bytes = vec![0u8; byte_idx + 1];
             if value {
                bytes[byte_idx] |= 1 << bit_idx;
             }
-            val.value = FyroDB::String(SmallStr::from_bytes(bytes));
-            val.expires_ms = 0;
+            *val = StoreValue::string_small(SmallStr::from_bytes(bytes));
             return Ok(0u8);
          }
          match val.value.as_string_mut() {
@@ -46,59 +45,31 @@ impl Store {
             }
             None => Err("WRONGTYPE"),
          }
-      });
+      };
+      let mut result = self.data.update_with(key, do_update);
 
-      match result {
-         Some(r) => r,
-         None => {
-            // Absent-key fallback. The create MUST be insert-if-absent:
-            // with 8 threads SETBITting different bits of a brand-new
-            // byte, an unconditional insert would let each creator
-            // overwrite the others' bits (battery 2 H3 lost-update).
-            loop {
-               let mut bytes = vec![0u8; byte_idx + 1];
-               if value {
-                  bytes[byte_idx] |= 1 << bit_idx;
-               }
-               if self
-                  .data
-                  .insert_if_absent_str(key, StoreValue::string_small(SmallStr::from_bytes(bytes)))
-               {
-                  return Ok(0);
-               }
-               // Lost the create race: the key exists now — retry the
-               // in-place update against it (the INCR pattern).
-               let retry = self.data.update_with(key, |val| {
-                  if val.is_expired() {
-                     let mut fresh = vec![0u8; byte_idx + 1];
-                     if value {
-                        fresh[byte_idx] |= 1 << bit_idx;
-                     }
-                     val.value = FyroDB::String(SmallStr::from_bytes(fresh));
-                     val.expires_ms = 0;
-                     return Ok(0u8);
-                  }
-                  match val.value.as_string_mut() {
-                     Some(s) => {
-                        s.ensure_len(byte_idx + 1);
-                        let bytes = s.as_bytes_mut();
-                        let old = (bytes[byte_idx] >> bit_idx) & 1;
-                        if value {
-                           bytes[byte_idx] |= 1 << bit_idx;
-                        } else {
-                           bytes[byte_idx] &= !(1 << bit_idx);
-                        }
-                        Ok(old)
-                     }
-                     None => Err("WRONGTYPE"),
-                  }
-               });
-               if let Some(r) = retry {
-                  return r;
-               }
-               // Key vanished between insert and update — re-create.
-            }
+      loop {
+         if let Some(r) = result {
+            return r;
          }
+         // Absent-key fallback. The create MUST be insert-if-absent:
+         // with 8 threads SETBITting different bits of a brand-new
+         // byte, an unconditional insert would let each creator
+         // overwrite the others' bits (battery 2 H3 lost-update).
+         let mut bytes = vec![0u8; byte_idx + 1];
+         if value {
+            bytes[byte_idx] |= 1 << bit_idx;
+         }
+         if self
+            .data
+            .insert_if_absent_str(key, StoreValue::string_small(SmallStr::from_bytes(bytes)))
+         {
+            return Ok(0);
+         }
+         // Lost the create race: the key exists now — retry the
+         // in-place update against it (the INCR pattern).
+         result = self.data.update_with(key, do_update);
+         // Key vanished between insert and update — re-create.
       }
    }
 
@@ -111,11 +82,9 @@ impl Store {
                let byte_idx = (offset / 8) as usize;
                let bit_idx = 7 - (offset % 8) as u8;
                let bytes = s.as_bytes();
-               if byte_idx >= bytes.len() {
-                  Ok(0)
-               } else {
-                  Ok((bytes[byte_idx] >> bit_idx) & 1)
-               }
+               Ok(bytes
+                 .get(byte_idx)
+                 .map_or(0, |b| (b >> bit_idx) & 1))
             }
             None => Err("WRONGTYPE"),
          },
@@ -185,32 +154,20 @@ impl Store {
    pub fn bitpos(
       &self,
       key: &str,
-      bit: u8,
+      bit: bool,
       start: i64,
       end: i64,
       has_end: bool,
       use_bit: bool,
    ) -> Result<i64, &'static str> {
       match self.data.get_ref(key) {
-         None => {
-            if bit == 0 {
-               Ok(0)
-            } else {
-               Ok(-1)
-            }
-         }
-         Some(e) if e.is_expired() => {
-            if bit == 0 {
-               Ok(0)
-            } else {
-               Ok(-1)
-            }
-         }
+         None => Ok(if bit { -1 } else { 0 }),
+         Some(e) if e.is_expired() => Ok(if bit { -1 } else { 0 }),
          Some(e) => match e.value.as_string() {
             Some(s) => {
                let bytes = s.as_bytes();
                if bytes.is_empty() {
-                  return Ok(if bit == 0 { 0 } else { -1 });
+                  return Ok(if bit { -1 } else { 0 });
                }
                if use_bit {
                   let bit_len = bytes.len() * 8;
@@ -221,14 +178,14 @@ impl Store {
                   }
                   let s_byte = s_idx / 8;
                   let e_byte = e_idx / 8;
-                  for byte_i in s_byte..=e_byte {
-                     if byte_i >= bytes.len() {
-                        break;
+                  let mut lo_mask = 0xFF_u8 >> (s_idx % 8);
+                  let mut hi_mask = 0xFF_u8;
+                  for byte_i in s_byte..=e_byte.min(bytes.len() - 1) {
+                     if byte_i == e_byte {
+                        hi_mask = 0xFF_u8 >> (7 - (e_idx % 8));
                      }
-                     let lo = if byte_i == s_byte { s_idx % 8 } else { 0 };
-                     let hi = if byte_i == e_byte { e_idx % 8 } else { 7 };
-                     let mask = (0xFF_u8 >> lo) & (0xFF_u8 << (7 - hi));
-                     let target = if bit == 1 {
+                     let mask = lo_mask & hi_mask;
+                     let target = if bit {
                         bytes[byte_i] & mask
                      } else {
                         !bytes[byte_i] & mask
@@ -236,6 +193,7 @@ impl Store {
                      if target != 0 {
                         return Ok((byte_i * 8 + target.leading_zeros() as usize) as i64);
                      }
+                     lo_mask = 0xFF_u8;
                   }
                   Ok(-1)
                } else {
@@ -256,12 +214,12 @@ impl Store {
                      return Ok(-1);
                   }
                   for (byte_idx, &b) in bytes.iter().enumerate().take(e_idx + 1).skip(s_idx) {
-                     let target = if bit == 1 { b } else { !b };
+                     let target = if bit { b } else { !b };
                      if target != 0 {
                         return Ok((byte_idx * 8 + target.leading_zeros() as usize) as i64);
                      }
                   }
-                  if bit == 0 && !has_end {
+                  if !bit && !has_end {
                      Ok((bytes.len() * 8) as i64)
                   } else {
                      Ok(-1)
@@ -273,75 +231,164 @@ impl Store {
       }
    }
 
+   #[inline]
+   fn combine_with(&self, keys: &[&str], len: usize, init: u8, f: impl Fn(u8, u8) -> u8) -> Result<Vec<u8>, &'static str> {
+      let mut result = vec![init; len];
+      keys.iter()
+         .filter_map(|&k| self.data.get_ref(k))
+         .try_for_each(|e| {
+            if let Some(s) = e.value.as_string() {
+               result.iter_mut().zip(s.as_bytes()).for_each(|(d, &b)| *d = f(*d, b));
+               return Ok(());
+            }
+            return Err("WRONGTYPE");
+         })?;
+      Ok(result)
+   }
+
    pub fn bitop(&self, op: BitOp, dest: &str, keys: &[&str]) -> Result<usize, &'static str> {
-      let mut max_len = 0usize;
-      let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+      // Pre‑allocate a single result buffer sized to the maximum length of any source.
+      let max_len = keys.iter()
+         .filter_map(|&k| self.data.get_ref(k)?.value.as_string().map(|s| s.len()))
+         .max()
+         .unwrap_or(0);
 
-      for &k in keys {
-         match self.data.get_ref(k) {
-            None => buffers.push(vec![]),
-            Some(e) if e.is_expired() => buffers.push(vec![]),
-            Some(e) => match e.value.as_string() {
-               Some(s) => {
-                  let b = s.as_bytes().to_vec();
-                  max_len = max_len.max(b.len());
-                  buffers.push(b);
-               }
-               None => return Err("WRONGTYPE"),
-            },
-         }
-      }
-
-      if buffers.is_empty() {
+      // If no source data, create an empty destination.
+      if max_len == 0 {
          self.data.insert_str(dest, StoreValue::string_str(""));
          return Ok(0);
       }
 
-      let mut result = vec![0u8; max_len];
-
-      match op {
-         BitOp::And => {
-            result = vec![0xFF; max_len];
-            for buf in &buffers {
-               for i in 0..max_len {
-                  let b = if i < buf.len() { buf[i] } else { 0 };
-                  result[i] &= b;
-               }
-            }
-         }
-         BitOp::Or => {
-            for buf in &buffers {
-               for i in 0..buf.len() {
-                  result[i] |= buf[i];
-               }
-            }
-         }
-         BitOp::Xor => {
-            for buf in &buffers {
-               for i in 0..buf.len() {
-                  result[i] ^= buf[i];
-               }
-            }
-         }
+      let result: Vec<u8> = match op {
+         BitOp::And => self.combine_with(keys, max_len, 0xFF, |d, s| d & s)?,
+         BitOp::Or => self.combine_with(keys, max_len, 0, |d, s| d | s)?,
+         BitOp::Xor => self.combine_with(keys, max_len, 0, |d, s| d ^ s)?,
          BitOp::Not => {
-            if buffers.len() != 1 {
+            if keys.len() != 1 {
                return Err("BITOP NOT requires one source key");
             }
-            for i in 0..max_len {
-               result[i] = if i < buffers[0].len() {
-                  !buffers[0][i]
-               } else {
-                  0xFF
-               };
-            }
+            let src = self.data.get_ref(keys[0]).ok_or("WRONGTYPE")?;
+            let s = src.value.as_string().ok_or("WRONGTYPE")?;
+            // Built directly from the source: no pre-filled buffer needed.
+            s.as_bytes().iter().map(|b| !b).collect()
          }
-      }
+      };
 
-      let len = result.len();
       self
          .data
          .insert_str(dest, StoreValue::string_small(SmallStr::from_bytes(result)));
-      Ok(len)
+      Ok(max_len)
+   }
+
+   pub fn bf_get(
+      &self,
+      key: &str,
+      offset: u64,
+      bits: u32,
+      signed: bool,
+   ) -> Result<i64, &'static str> {
+      if bits == 0 {
+         return Ok(0);
+      }
+      if bits > 64 {
+         return Err("invalid bitfield type");
+      }
+      match self.data.get_ref(key) {
+         None => Ok(0),
+         Some(e) if e.is_expired() => Ok(0),
+         Some(e) => match e.value.as_string() {
+            Some(s) => {
+               let bytes = s.as_bytes();
+               let start_bit = offset;
+               let end_bit = offset + bits as u64;
+               let start_byte = (start_bit / 8) as usize;
+               let end_byte = end_bit.div_ceil(8) as usize;
+               let mut val: u64 = 0;
+
+               for b_idx in start_byte..end_byte {
+                  let byte_val = if b_idx < bytes.len() { bytes[b_idx] } else { 0 };
+                  let b_start = start_bit.max(b_idx as u64 * 8);
+                  let b_end = end_bit.min(b_idx as u64 * 8 + 8);
+                  let num_bits = (b_end - b_start) as u32;
+                  let shift_right = (b_idx as u64 * 8 + 8 - b_end) as u32;
+                  let mask = ((1u16 << num_bits) - 1) as u8;
+                  let extracted_bits = ((byte_val >> shift_right) & mask) as u64;
+                  let shift_left = (end_bit - b_end) as u32;
+                  val |= extracted_bits << shift_left;
+               }
+
+               if signed && bits < 64 && (val >> (bits - 1)) & 1 == 1 {
+                  Ok((val | (!0u64 << bits)) as i64)
+               } else {
+                  Ok(val as i64)
+               }
+            }
+            None => Err("WRONGTYPE"),
+         },
+      }
+   }
+
+   pub fn bf_set(&self, key: &str, offset: u64, bits: u32, value: i64) -> Result<(), &'static str> {
+      if bits == 0 {
+         return Ok(());
+      }
+      if bits > 64 {
+         return Err("invalid bitfield type");
+      }
+
+      let last_byte_idx = ((offset + bits as u64 - 1) / 8) as usize;
+      let val = value as u64;
+
+      let write_bits = |bytes: &mut [u8]| {
+         let start_bit = offset;
+         let end_bit = offset + bits as u64;
+         let start_byte = (start_bit / 8) as usize;
+         let end_byte = end_bit.div_ceil(8) as usize;
+
+         for (offset_idx, byte) in bytes[start_byte..end_byte].iter_mut().enumerate() {
+            let b_idx = start_byte + offset_idx;
+            let b_start = start_bit.max(b_idx as u64 * 8);
+            let b_end = end_bit.min(b_idx as u64 * 8 + 8);
+            let num_bits = (b_end - b_start) as u32;
+            let val_shift_right = (end_bit - b_end) as u32;
+            let bits_to_write =
+               ((val >> val_shift_right) & (((1u16 << num_bits) - 1) as u64)) as u8;
+            let byte_shift_left = (b_idx as u64 * 8 + 8 - b_end) as u32;
+            let shifted_bits = bits_to_write << byte_shift_left;
+            let mask = (((1u16 << num_bits) - 1) as u8) << byte_shift_left;
+            *byte = (*byte & !mask) | shifted_bits;
+         }
+      };
+
+      let result = self.data.update_with(key, |v| {
+         let is_expired = v.is_expired();
+         match v.value.as_string_mut() {
+            Some(s) => {
+               s.ensure_len(last_byte_idx + 1);
+               let bytes = s.as_bytes_mut();
+               if is_expired {
+                  bytes.fill(0);
+                  v.expires_ms = 0;
+               }
+               write_bits(bytes);
+               Ok(())
+            }
+            None => Err("WRONGTYPE"),
+         }
+      });
+
+      match result {
+         Some(r) => r,
+         None => {
+            let mut s = SmallStr::with_capacity(last_byte_idx + 1);
+            write_bits(s.as_bytes_mut());
+            self.data.insert(
+               key.to_string(),
+               StoreValue::string_small(s)
+            );
+            Ok(())
+         }
+      }
    }
 }
 
@@ -358,6 +405,6 @@ fn normalize_bit_index(idx: i64, bit_len: usize) -> usize {
    if idx < 0 {
       (bit_len as i64 + idx).max(0) as usize
    } else {
-      (idx as usize).min(bit_len.saturating_sub(1))
+      (idx as usize).min(bit_len - 1)
    }
 }
