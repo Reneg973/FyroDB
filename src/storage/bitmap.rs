@@ -226,78 +226,53 @@ impl Store {
       }
    }
 
+   fn combine(&self, keys: &[&str], len: usize, init: u8, f: impl Fn(u8, u8) -> u8) -> Vec<u8> {
+      let mut result = vec![init; len];
+      keys.iter()
+         .filter_map(|&k| self.data.get_ref(k))
+         .for_each(|e| {
+            if let Some(s) = e.value.as_string() {
+               result.iter_mut().zip(s.as_bytes()).for_each(|(d, &b)| *d = f(*d, b));
+            }
+         });
+      result
+   }
+
    pub fn bitop(&self, op: BitOp, dest: &str, keys: &[&str]) -> Result<usize, &'static str> {
-      let mut max_len = 0usize;
-      let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+      // Pre‑allocate a single result buffer sized to the maximum length of any source.
+      let max_len = keys.iter()
+         .filter_map(|&k| self.data.get_ref(k))
+         .filter_map(|e|
+            e.value.as_string().map(|s| s.len()))
+         .max()
+         .unwrap_or(0);
 
-      for &k in keys {
-         match self.data.get_ref(k) {
-            None => buffers.push(vec![]),
-            Some(e) if e.is_expired() => buffers.push(vec![]),
-            Some(e) => match e.value.as_string() {
-               Some(s) => {
-                  let b = s.as_bytes().to_vec();
-                  max_len = max_len.max(b.len());
-                  buffers.push(b);
-               }
-               None => return Err("WRONGTYPE"),
-            },
-         }
-      }
-
-      if buffers.is_empty() {
-         self
-            .data
-            .insert(dest.to_string(), StoreValue::string(String::new()));
+      // If no source data, create an empty destination.
+      if max_len == 0 {
+         self.data.insert(dest.to_string(), StoreValue::string(String::new()));
          return Ok(0);
       }
 
-      let mut result = vec![0u8; max_len];
-
-      match op {
-         BitOp::And => {
-            result = vec![0xFF; max_len];
-            for buf in &buffers {
-               for i in 0..max_len {
-                  let b = if i < buf.len() { buf[i] } else { 0 };
-                  result[i] &= b;
-               }
-            }
-         }
-         BitOp::Or => {
-            for buf in &buffers {
-               for i in 0..buf.len() {
-                  result[i] |= buf[i];
-               }
-            }
-         }
-         BitOp::Xor => {
-            for buf in &buffers {
-               for i in 0..buf.len() {
-                  result[i] ^= buf[i];
-               }
-            }
-         }
+      let result: Vec<u8> = match op {
+         BitOp::And => self.combine(keys, max_len, 0xFF, |d, s| d & s),
+         BitOp::Or => self.combine(keys, max_len, 0, |d, s| d | s),
+         BitOp::Xor => self.combine(keys, max_len, 0, |d, s| d ^ s),
          BitOp::Not => {
-            if buffers.len() != 1 {
+            if keys.len() != 1 {
                return Err("BITOP NOT requires one source key");
             }
-            for i in 0..max_len {
-               result[i] = if i < buffers[0].len() {
-                  !buffers[0][i]
-               } else {
-                  0xFF
-               };
-            }
+            let src = self.data.get_ref(keys[0]).ok_or("WRONGTYPE")?;
+            let s = src.value.as_string().ok_or("WRONGTYPE")?;
+            // Built directly from the source: no pre-filled buffer needed.
+            s.as_bytes().iter().map(|b| !b).collect()
          }
-      }
+      };
 
-      let len = result.len();
       self.data.insert(
          dest.to_string(),
          StoreValue::string(unsafe { String::from_utf8_unchecked(result) }),
       );
-      Ok(len)
+      Ok(max_len)
    }
 
    pub fn bf_get(
