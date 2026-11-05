@@ -83,7 +83,7 @@ fn bitcount_missing_key() {
 fn bitpos_find_first_set() {
    let s = store();
    s.setbit("k", 10, true).unwrap();
-   assert_eq!(s.bitpos("k", 1, 0, -1, false, false), Ok(10));
+   assert_eq!(s.bitpos("k", true, 0, -1, false, false), Ok(10));
 }
 
 #[test]
@@ -92,13 +92,13 @@ fn bitpos_find_first_clear() {
    for i in 0..8 {
       s.setbit("k", i, true).unwrap();
    }
-   assert_eq!(s.bitpos("k", 0, 0, -1, false, false), Ok(8));
+   assert_eq!(s.bitpos("k", false, 0, -1, false, false), Ok(8));
 }
 
 #[test]
 fn bitpos_not_found() {
    let s = store();
-   assert_eq!(s.bitpos("k", 1, 0, -1, false, false), Ok(-1));
+   assert_eq!(s.bitpos("k", true, 0, -1, false, false), Ok(-1));
 }
 
 #[test]
@@ -122,6 +122,16 @@ fn bitop_and() {
    assert_eq!(len, 1);
    assert_eq!(s.getbit("dst", 0), Ok(1));
    assert_eq!(s.getbit("dst", 1), Ok(0));
+}
+
+#[test]
+fn bitop_and_wrong_type() {
+   let s = store();
+   s.setbit("a", 0, true).unwrap();
+   s.setbit("a", 3, true).unwrap();
+   s.lpush("b", &[&"hello"]).unwrap();
+   let r = s.bitop(BitOp::And, "dst", &["a", "b"]);
+   assert_eq!(r, Err("WRONGTYPE"));
 }
 
 #[test]
