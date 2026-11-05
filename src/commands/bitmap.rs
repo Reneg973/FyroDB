@@ -65,7 +65,7 @@ pub fn bitpos(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
    };
    resp::write_integer(
       out,
-      store_ok!(out, store.bitpos(key, bit, start, end, has_end, use_bit)),
+      store_ok!(out, store.bitpos(key, bit != 0, start, end, has_end, use_bit)),
    );
 }
 
