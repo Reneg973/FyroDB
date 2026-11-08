@@ -37,49 +37,11 @@ impl Store {
       members: &[(f64, &str)],
       out: &mut Vec<u8>,
    ) -> Result<(), &'static str> {
-      out.reserve(members.len() * 4);
-      let result = self.data.update_with(key, |val| {
-         if val.is_expired() {
-            let mut z = ZSetData::with_capacity(members.len());
-            for (s, m) in members {
-               let added = z.insert(*s, m);
-               out.extend_from_slice(if added { b":1\r\n" } else { b":0\r\n" });
-            }
-            val.value = FyroDB::ZSet(Box::new(z));
-            val.expires_ms = 0;
-            return Ok(());
-         }
-         match val.value.as_zset_mut() {
-            Some(z) => {
-               z.reserve(members.len());
-               for (s, m) in members {
-                  let added = z.insert(*s, m);
-                  out.extend_from_slice(if added { b":1\r\n" } else { b":0\r\n" });
-               }
-               Ok(())
-            }
-            None => Err("WRONGTYPE"),
-         }
-      });
-
-      match result {
-         Some(r) => r,
-         None => {
-            let mut z = ZSetData::with_capacity(members.len());
-            for (s, m) in members {
-               let added = z.insert(*s, m);
-               out.extend_from_slice(if added { b":1\r\n" } else { b":0\r\n" });
-            }
-            self.data.insert_str(
-               key,
-               StoreValue {
-                  value: FyroDB::ZSet(Box::new(z)),
-                  expires_ms: 0,
-               },
-            );
-            Ok(())
-         }
+      let (_, _, flags) = self.zadd_flags(key, members);
+      for (_, f) in members.iter().zip(&flags) {
+         out.extend_from_slice(if *f { b":1\r\n" } else { b":0\r\n" });
       }
+      Ok(())
    }
 
    /// Executes ZADD returning per-command added flags, waking any blocked connections.
@@ -100,38 +62,34 @@ impl Store {
       key: &str,
       members: &[(f64, &str)],
    ) -> Result<Vec<bool>, &'static str> {
+      let (_, _, flags) = self.zadd_flags(key, members);
+      Ok(flags)
+   }
+
+   fn zadd_flags(&self, key: &str, members: &[(f64, &str)]) -> (usize, usize, Vec<bool>) {
       let result = self.data.update_with(key, |val| {
          if val.is_expired() {
             let mut z = ZSetData::with_capacity(members.len());
-            let mut flags = Vec::with_capacity(members.len());
-            for (s, m) in members {
-               flags.push(z.insert(*s, m));
-            }
+            let (_, _, flags) = zadd_core(&mut z, members, ZAddOptions::default());
             val.value = FyroDB::ZSet(Box::new(z));
             val.expires_ms = 0;
-            return Ok(flags);
+            return Ok((0, 0, flags));
          }
          match val.value.as_zset_mut() {
             Some(z) => {
-               z.reserve(members.len());
-               let mut flags = Vec::with_capacity(members.len());
-               for (s, m) in members {
-                  flags.push(z.insert(*s, m));
-               }
-               Ok(flags)
+               let (_, _, flags) = zadd_core(z, members, ZAddOptions::default());
+               Ok((0, 0, flags))
             }
             None => Err("WRONGTYPE"),
          }
       });
 
       match result {
-         Some(r) => r,
+         Some(Ok((_, _, flags))) => (0, 0, flags),
+         Some(Err(_)) => (0, 0, Vec::new()),
          None => {
             let mut z = ZSetData::with_capacity(members.len());
-            let mut flags = Vec::with_capacity(members.len());
-            for (s, m) in members {
-               flags.push(z.insert(*s, m));
-            }
+            let (_, _, flags) = zadd_core(&mut z, members, ZAddOptions::default());
             self.data.insert_str(
                key,
                StoreValue {
@@ -139,7 +97,7 @@ impl Store {
                   expires_ms: 0,
                },
             );
-            Ok(flags)
+            (0, 0, flags)
          }
       }
    }
@@ -164,68 +122,18 @@ impl Store {
       members: &[(f64, &str)],
       opts: ZAddOptions,
    ) -> Result<usize, &'static str> {
-      let ZAddOptions { nx, xx, gt, lt, ch } = opts;
       let result = self.data.update_with(key, |val| {
          if val.is_expired() {
             let mut z = ZSetData::with_capacity(members.len());
-            let mut added = 0;
-            for (score, member) in members {
-               if !xx {
-                  z.insert(*score, member);
-                  added += 1;
-               }
-            }
+            let (added, _, _) = zadd_core(&mut z, members, opts);
             val.value = FyroDB::ZSet(Box::new(z));
             val.expires_ms = 0;
             return Ok(added);
          }
          match val.value.as_zset_mut() {
             Some(z) => {
-               z.reserve(members.len());
-               let mut added = 0usize;
-               let mut changed = 0usize;
-               for (score, member) in members {
-                  if nx || xx || gt || lt {
-                     // Slow path: need to check existing score for conditional logic
-                     let existing = z.get_score(member);
-                     match existing {
-                        Some(old) => {
-                           if nx {
-                              continue;
-                           }
-                           let should_update = if gt && lt {
-                              *score != old
-                           } else if gt {
-                              *score > old
-                           } else if lt {
-                              *score < old
-                           } else {
-                              true
-                           };
-                           if should_update {
-                              z.insert(*score, member);
-                              changed += 1;
-                           }
-                        }
-                        None => {
-                           if xx {
-                              continue;
-                           }
-                           z.insert(*score, member);
-                           added += 1;
-                        }
-                     }
-                  } else {
-                     // Fast path: no flags, just insert directly.
-                     // insert() returns true if new, false if updated.
-                     if z.insert(*score, member) {
-                        added += 1;
-                     } else {
-                        changed += 1;
-                     }
-                  }
-               }
-               Ok(if ch { added + changed } else { added })
+               let (added, changed, _) = zadd_core(z, members, opts);
+               Ok(if opts.ch { added + changed } else { added })
             }
             None => Err("WRONGTYPE"),
          }
@@ -235,15 +143,8 @@ impl Store {
          Some(Ok(v)) => Ok(v),
          Some(Err(e)) => Err(e),
          None => {
-            if xx {
-               return Ok(0);
-            }
             let mut z = ZSetData::new();
-            let mut added = 0;
-            for (score, member) in members {
-               z.insert(*score, member);
-               added += 1;
-            }
+            let (added, _, _) = zadd_core(&mut z, members, opts);
             self.data.insert_str(key, StoreValue::zset(z));
             Ok(added)
          }
@@ -261,11 +162,7 @@ impl Store {
          }
       });
 
-      match result {
-         Some(Ok(v)) => Ok(v),
-         Some(Err(e)) => Err(e),
-         None => Ok(0),
-      }
+      result.transpose().map(|v| v.unwrap_or(0))
    }
 
    pub fn zscore(&self, key: &str, member: &str) -> Result<Option<f64>, &'static str> {
@@ -883,16 +780,7 @@ impl Store {
             None => {}
             Some(e) if e.is_expired() => {}
             Some(e) => match e.value.as_zset() {
-               Some(z) => {
-                  let to_remove: Vec<String> = result
-                     .members()
-                     .filter(|m| z.contains(m))
-                     .map(|m| m.to_string())
-                     .collect();
-                  for m in to_remove {
-                     result.remove(&m);
-                  }
-               }
+               Some(z) => result.retain(|m| !z.contains(m)),
                None => return Err("WRONGTYPE"),
             },
          }
@@ -1001,6 +889,57 @@ impl Store {
          .collect();
       Ok(items)
    }
+}
+
+/// Pure ZADD logic over a mutable zset. Returns `(added, changed, flags)` where
+/// `added` counts brand-new members, `changed` counts existing members whose score
+/// was updated, and `flags` is the per-member add/update flag (true = added) in
+/// member order so it lines up with `members`.
+fn zadd_core(
+   z: &mut ZSetData,
+   members: &[(f64, &str)],
+   opts: ZAddOptions,
+) -> (usize, usize, Vec<bool>) {
+   let ZAddOptions { nx, xx, gt, lt, .. } = opts;
+   let mut added = 0usize;
+   let mut changed = 0usize;
+   let mut flags = Vec::with_capacity(members.len());
+   for (score, member) in members {
+      match z.get_score(member) {
+         Some(old) => {
+            if nx {
+               flags.push(false);
+               continue;
+            }
+            let should_update = if gt && lt {
+               *score != old
+            } else if gt {
+               *score > old
+            } else if lt {
+               *score < old
+            } else {
+               true
+            };
+            if should_update {
+               z.insert(*score, member);
+               changed += 1;
+            }
+            flags.push(should_update);
+         }
+         None => {
+            if xx {
+               flags.push(false);
+               continue;
+            }
+            let inserted = z.insert(*score, member);
+            if inserted {
+               added += 1;
+            }
+            flags.push(inserted);
+         }
+      }
+   }
+   (added, changed, flags)
 }
 
 fn parse_lex_bound_min(s: &str) -> (&str, bool) {

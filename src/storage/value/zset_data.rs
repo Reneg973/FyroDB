@@ -1,11 +1,11 @@
-use super::small_str::SmallStr;
+use super::small_str::{SmallStr, SmallStrRef};
 use std::collections::HashMap;
 
 const CHUNK_MAX: usize = 64;
 const INDEX_ON: usize = 128;
 const INDEX_OFF: usize = 64;
 
-type Index = HashMap<SmallStr, f64, foldhash::fast::RandomState>;
+type Index = HashMap<SmallStrRef, f64, foldhash::fast::RandomState>;
 
 #[derive(Clone)]
 pub struct ZSetData {
@@ -209,7 +209,7 @@ impl ZSetData {
       if self.index.is_none() && self.len > INDEX_ON {
          let mut ix = Index::with_capacity_and_hasher(self.len, Default::default());
          for e in self.chunks.iter().flatten() {
-            ix.insert(e.member.clone(), e.score);
+            ix.insert(e.member.clone_as_ref(), e.score);
          }
          self.index = Some(Box::new(ix));
       } else if self.index.is_some() && self.len < INDEX_OFF {
@@ -223,7 +223,7 @@ impl ZSetData {
          member: SmallStr::new(member),
       };
       if let Some(ix) = &mut self.index {
-         ix.insert(entry.member.clone(), score);
+         ix.insert(entry.member.clone_as_ref(), score);
       }
       self.len += 1;
       self.place(entry);
@@ -294,7 +294,7 @@ impl ZSetData {
             return false;
          }
          let m = SmallStr::new(member);
-         ix.insert(m.clone(), score);
+         ix.insert(m.clone_as_ref(), score);
          self.len += 1;
          self.place(ZEntry { score, member: m });
          return true;
@@ -597,6 +597,25 @@ impl ZSetData {
          ix.shrink_to_fit();
       }
    }
+
+   pub fn retain(&mut self, f: impl Fn(&str) -> bool) {
+      let mut removed = 0usize;
+      let index = &mut self.index;
+      self.chunks.iter_mut().for_each(|c| {
+         let old_len = c.len();
+         c.retain(|m| {
+            let keep = f(m.member.as_str());
+            if !keep {
+               if let Some(ix) = index {
+                  ix.remove(m.member.as_str());
+               }
+            }
+            keep
+         });
+         removed += old_len - c.len();
+      });
+      self.finish_bulk_remove(removed);
+   }
 }
 
 impl Default for ZSetData {
@@ -628,6 +647,57 @@ mod tests {
          assert_eq!(z.rank(m), Some(r));
          assert_eq!(z.get(r).map(|e| e.member.as_str()), Some(m.as_str()));
       }
+   }
+
+   #[test]
+   fn retain_preserves_index_for_kept_members() {
+      let mut z = ZSetData::new();
+      for i in 0..200 {
+         z.insert(i as f64, &format!("m{i}"));
+      }
+
+      z.retain(|_| true);
+      assert_eq!(z.len(), 200);
+      for i in 0..200 {
+         assert_eq!(z.get_score(&format!("m{i}")), Some(i as f64));
+      }
+
+      z.retain(|m| m[1..].parse::<usize>().unwrap() % 2 == 1);
+      assert_eq!(z.len(), 100);
+      assert!(z.index.is_some());
+      assert_eq!(z.iter().count(), 100);
+      for i in 0..200 {
+         let expected = if i % 2 == 1 { Some(i as f64) } else { None };
+         assert_eq!(z.get_score(&format!("m{i}")), expected);
+         assert_eq!(z.contains(&format!("m{i}")), expected.is_some());
+      }
+      assert!(z.insert(300.0, "m0"));
+      assert!(!z.insert(301.0, "m1"));
+      assert_eq!(z.len(), 101);
+      assert_eq!(z.get_score("m0"), Some(300.0));
+      assert_eq!(z.get_score("m1"), Some(301.0));
+   }
+
+   #[test]
+   fn retain_compacts_chunks_and_drops_small_index() {
+      let mut z = ZSetData::new();
+      for i in 0..200 {
+         z.insert(i as f64, &format!("m{i}"));
+      }
+
+      z.retain(|m| m == "m199");
+      assert_eq!(z.len(), 1);
+      assert_eq!(z.chunks.len(), 1);
+      assert!(z.index.is_none());
+      assert_eq!(z.get_score("m199"), Some(199.0));
+      assert_eq!(z.get_score("m0"), None);
+
+      z.retain(|_| false);
+      assert_eq!(z.len(), 0);
+      assert_eq!(z.iter().count(), 0);
+      assert!(z.chunks.is_empty());
+      assert!(z.insert(1.0, "new"));
+      assert_eq!(z.get_score("new"), Some(1.0));
    }
 
    #[test]
