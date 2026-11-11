@@ -40,8 +40,7 @@ pub(super) fn dispatch_set_expire_pair(
       return PairOutcome::FallThrough;
    }
 
-   let (key, value): (&str, &str);
-   {
+   let (key, value) = {
       let out = &mut conn.parser.wbuf;
       let Some(k) = part_str(out, set[1]) else {
          return PairOutcome::ConnError;
@@ -49,9 +48,8 @@ pub(super) fn dispatch_set_expire_pair(
       let Some(v) = part_str(out, set[2]) else {
          return PairOutcome::ConnError;
       };
-      key = k;
-      value = v;
-   }
+      (k, v)
+   };
 
    // Consume and parse the EXPIRE command.
    match conn.parser.parse_one() {
@@ -76,7 +74,7 @@ pub(super) fn dispatch_set_expire_pair(
          conn.store.record_current_value(key);
       }
       conn.parser.wbuf.extend_from_slice(b"+OK\r\n");
-      dispatch_raw(conn, expire);
+      conn.dispatch_raw(expire);
       return PairOutcome::Done;
    }
    if unsafe { part_bytes(expire[1]) } != key.as_bytes() {
@@ -86,7 +84,7 @@ pub(super) fn dispatch_set_expire_pair(
          conn.store.record_current_value(key);
       }
       conn.parser.wbuf.extend_from_slice(b"+OK\r\n");
-      dispatch_raw(conn, expire);
+      conn.dispatch_raw(expire);
       return PairOutcome::Done;
    }
    let secs_str: &str;
@@ -112,7 +110,7 @@ pub(super) fn dispatch_set_expire_pair(
          conn.store.record_current_value(key);
       }
       conn.parser.wbuf.extend_from_slice(b"+OK\r\n");
-      dispatch_raw(conn, expire);
+      conn.dispatch_raw(expire);
       return PairOutcome::Done;
    };
 
@@ -205,7 +203,7 @@ pub(super) fn dispatch_publish_run(
                   Err(()) => QueueRunOutcome::ConnError,
                };
                if matches!(outcome, QueueRunOutcome::Done) {
-                  dispatch_raw(conn, raw);
+                  conn.dispatch_raw(raw);
                }
                return outcome;
             }
@@ -332,7 +330,7 @@ pub(super) fn is_write_run(raw: &[(*const u8, usize)]) -> bool {
    WriteOp::parse(cmd).is_some_and(|op| raw.len() == op.arity())
 }
 
-use crate::utils::resp::format_usize_digits;
+use crate::utils::resp::{format_usize_digits, is_crlf_at};
 
 #[inline(always)]
 fn try_fast_tail(
@@ -350,16 +348,13 @@ fn try_fast_tail(
       if unsafe { *buf.add(offset) } != b'$' {
          return None;
       }
-      let (len, hdr_len) =
-         unsafe { crate::utils::parser::parse_len_le4(buf.add(offset + 1), avail - (offset + 1)) }?;
+      let (len, hdr_len) = crate::utils::parser::parse_len_le4_at(buf, offset + 1, avail)?;
       let data_offset = offset + 1 + hdr_len;
       let next_offset = data_offset + len + 2;
       if avail < next_offset {
          return None;
       }
-      if unsafe { std::ptr::read_unaligned(buf.add(next_offset - 2) as *const u16) }
-         != u16::from_ne_bytes(*b"\r\n")
-      {
+      if !is_crlf_at(buf, next_offset - 2) {
          return None;
       }
       *out_part = (unsafe { buf.add(data_offset) }, len);
@@ -469,7 +464,7 @@ pub(super) fn dispatch_write_run(
                   Err(()) => QueueRunOutcome::ConnError,
                };
                if matches!(outcome, QueueRunOutcome::Done) {
-                  dispatch_raw(conn, raw);
+                  conn.dispatch_raw(raw);
                }
                return outcome;
             }
@@ -997,7 +992,7 @@ pub(super) fn dispatch_queue_run(
                   Err(()) => QueueRunOutcome::ConnError,
                };
                if matches!(outcome, QueueRunOutcome::Done) {
-                  dispatch_raw(conn, raw);
+                  conn.dispatch_raw(raw);
                }
                return outcome;
             }

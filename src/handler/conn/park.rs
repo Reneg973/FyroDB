@@ -230,6 +230,108 @@ impl<'a> Conn<'a> {
          self.store.blocking.unregister(&b.keys, self.uid);
       }
    }
+
+   pub(super) fn dispatch_stream_read(&mut self, raw: &[(*const u8, usize)]) {
+      let mut args: Vec<&str> = Vec::with_capacity(raw.len());
+      for &p in raw {
+         match std::str::from_utf8(unsafe { part_bytes(p) }) {
+            Ok(s) => args.push(s),
+            Err(_) => return resp::write_err(&mut self.parser.wbuf, "invalid UTF-8 in request"),
+         }
+      }
+      let grouped = args[0].eq_ignore_ascii_case("XREADGROUP");
+      let mut req = match crate::commands::stream::parse_xread(&args, grouped) {
+         Ok(r) => r,
+         Err(e) => return resp::write_store_err(&mut self.parser.wbuf, &e),
+      };
+      req.resolve_dollar(self.store);
+      let timeout = req.block.filter(|ms| *ms > 0).map(Duration::from_millis);
+      let history = grouped && req.ids.iter().any(|id| id != ">");
+      if history {
+         req.serve(self.store, &mut self.parser.wbuf, true);
+         if self.store.has_replication() {
+            for k in &req.keys {
+               self.store.record_current_value(k);
+            }
+         }
+         return;
+      }
+      self.start_blocking(Box::new(XRead { req }), timeout);
+   }
+
+   /// Parse and start one blocking list/zset command from raw parts.
+   pub(super) fn dispatch_blocking(&mut self, raw: &[(*const u8, usize)]) {
+      let mut args: Vec<String> = Vec::with_capacity(raw.len());
+      for &p in raw {
+         match std::str::from_utf8(unsafe { part_bytes(p) }) {
+            Ok(s) => args.push(s.to_string()),
+            Err(_) => return resp::write_err(&mut self.parser.wbuf, "invalid UTF-8 in request"),
+         }
+      }
+      let name = args[0].to_ascii_uppercase();
+      let out = &mut self.parser.wbuf;
+      let wrong = |out: &mut Vec<u8>| resp::write_wrong_args(out, &name.to_ascii_lowercase());
+      let (op, timeout): (Box<dyn BlockingOp>, &str) = match name.as_str() {
+         "BLPOP" | "BRPOP" | "BZPOPMIN" | "BZPOPMAX" => {
+            if args.len() < 3 {
+               return wrong(out);
+            }
+            let keys = args[1..args.len() - 1].to_vec();
+            let op: Box<dyn BlockingOp> = match name.as_str() {
+               "BLPOP" => Box::new(Pop {
+                  keys,
+                  right: false,
+                  scratch: String::new(),
+               }),
+               "BRPOP" => Box::new(Pop {
+                  keys,
+                  right: true,
+                  scratch: String::new(),
+               }),
+               "BZPOPMIN" => Box::new(ZPop { keys, max: false }),
+               _ => Box::new(ZPop { keys, max: true }),
+            };
+            (op, args.last().unwrap())
+         }
+         "BLMOVE" => {
+            if args.len() != 6 {
+               return wrong(out);
+            }
+            let side = |s: &str| match s.to_ascii_uppercase().as_str() {
+               "LEFT" => Some(true),
+               "RIGHT" => Some(false),
+               _ => None,
+            };
+            let (Some(left_src), Some(left_dst)) = (side(&args[3]), side(&args[4])) else {
+               return resp::write_store_err(out, "ERR syntax error");
+            };
+            let op = Box::new(Move {
+               src: args[1].clone(),
+               dst: args[2].clone(),
+               left_src,
+               left_dst,
+            });
+            (op, &args[5])
+         }
+         "BRPOPLPUSH" => {
+            if args.len() != 4 {
+               return wrong(out);
+            }
+            let op = Box::new(Move {
+               src: args[1].clone(),
+               dst: args[2].clone(),
+               left_src: false,
+               left_dst: true,
+            });
+            (op, &args[3])
+         }
+         _ => return wrong(out),
+      };
+      match parse_timeout(timeout) {
+         Ok(t) => self.start_blocking(op, t),
+         Err(e) => resp::write_store_err(out, e),
+      }
+   }
 }
 
 /// Parse a Redis blocking timeout (seconds, may be fractional; 0 = forever).
@@ -396,34 +498,6 @@ pub(super) fn is_blocking_stream_read(cmd: &[u8], raw: &[(*const u8, usize)]) ->
    false
 }
 
-pub(super) fn dispatch_stream_read(conn: &mut Conn<'_>, raw: &[(*const u8, usize)]) {
-   let mut args: Vec<&str> = Vec::with_capacity(raw.len());
-   for &p in raw {
-      match std::str::from_utf8(unsafe { part_bytes(p) }) {
-         Ok(s) => args.push(s),
-         Err(_) => return resp::write_err(&mut conn.parser.wbuf, "invalid UTF-8 in request"),
-      }
-   }
-   let grouped = args[0].eq_ignore_ascii_case("XREADGROUP");
-   let mut req = match crate::commands::stream::parse_xread(&args, grouped) {
-      Ok(r) => r,
-      Err(e) => return resp::write_store_err(&mut conn.parser.wbuf, &e),
-   };
-   req.resolve_dollar(conn.store);
-   let timeout = req.block.filter(|ms| *ms > 0).map(Duration::from_millis);
-   let history = grouped && req.ids.iter().any(|id| id != ">");
-   if history {
-      req.serve(conn.store, &mut conn.parser.wbuf, true);
-      if conn.store.has_replication() {
-         for k in &req.keys {
-            conn.store.record_current_value(k);
-         }
-      }
-      return;
-   }
-   conn.start_blocking(Box::new(XRead { req }), timeout);
-}
-
 /// Commands this module blocks for; everything else dispatches normally.
 pub(super) fn is_blocking_cmd(cmd: &[u8]) -> bool {
    matches!(cmd.len(), 5 | 6 | 8 | 10)
@@ -433,80 +507,6 @@ pub(super) fn is_blocking_cmd(cmd: &[u8]) -> bool {
          || cmd.eq_ignore_ascii_case(b"BZPOPMIN")
          || cmd.eq_ignore_ascii_case(b"BZPOPMAX")
          || cmd.eq_ignore_ascii_case(b"BRPOPLPUSH"))
-}
-
-/// Parse and start one blocking list/zset command from raw parts.
-pub(super) fn dispatch_blocking(conn: &mut Conn<'_>, raw: &[(*const u8, usize)]) {
-   let mut args: Vec<String> = Vec::with_capacity(raw.len());
-   for &p in raw {
-      match std::str::from_utf8(unsafe { part_bytes(p) }) {
-         Ok(s) => args.push(s.to_string()),
-         Err(_) => return resp::write_err(&mut conn.parser.wbuf, "invalid UTF-8 in request"),
-      }
-   }
-   let name = args[0].to_ascii_uppercase();
-   let out = &mut conn.parser.wbuf;
-   let wrong = |out: &mut Vec<u8>| resp::write_wrong_args(out, &name.to_ascii_lowercase());
-   let (op, timeout): (Box<dyn BlockingOp>, &str) = match name.as_str() {
-      "BLPOP" | "BRPOP" | "BZPOPMIN" | "BZPOPMAX" => {
-         if args.len() < 3 {
-            return wrong(out);
-         }
-         let keys = args[1..args.len() - 1].to_vec();
-         let op: Box<dyn BlockingOp> = match name.as_str() {
-            "BLPOP" => Box::new(Pop {
-               keys,
-               right: false,
-               scratch: String::new(),
-            }),
-            "BRPOP" => Box::new(Pop {
-               keys,
-               right: true,
-               scratch: String::new(),
-            }),
-            "BZPOPMIN" => Box::new(ZPop { keys, max: false }),
-            _ => Box::new(ZPop { keys, max: true }),
-         };
-         (op, args.last().unwrap())
-      }
-      "BLMOVE" => {
-         if args.len() != 6 {
-            return wrong(out);
-         }
-         let side = |s: &str| match s.to_ascii_uppercase().as_str() {
-            "LEFT" => Some(true),
-            "RIGHT" => Some(false),
-            _ => None,
-         };
-         let (Some(left_src), Some(left_dst)) = (side(&args[3]), side(&args[4])) else {
-            return resp::write_store_err(out, "ERR syntax error");
-         };
-         let op = Box::new(Move {
-            src: args[1].clone(),
-            dst: args[2].clone(),
-            left_src,
-            left_dst,
-         });
-         (op, &args[5])
-      }
-      "BRPOPLPUSH" => {
-         if args.len() != 4 {
-            return wrong(out);
-         }
-         let op = Box::new(Move {
-            src: args[1].clone(),
-            dst: args[2].clone(),
-            left_src: false,
-            left_dst: true,
-         });
-         (op, &args[3])
-      }
-      _ => return wrong(out),
-   };
-   match parse_timeout(timeout) {
-      Ok(t) => conn.start_blocking(op, t),
-      Err(e) => resp::write_store_err(out, e),
-   }
 }
 
 #[cfg(test)]

@@ -1,3 +1,5 @@
+use crate::utils::int_format::write_usize;
+
 pub const RESP3_NULL: &[u8] = b"_\r\n";
 pub const RESP3_TRUE: &[u8] = b"#t\r\n";
 pub const RESP3_FALSE: &[u8] = b"#f\r\n";
@@ -37,7 +39,7 @@ pub fn write_big_number(out: &mut Vec<u8>, n: &str) {
 pub fn write_verbatim_string(out: &mut Vec<u8>, encoding: &str, data: &str) {
    let total_len = encoding.len() + 1 + data.len();
    out.push(b'=');
-   super::resp::write_usize(out, total_len);
+   write_usize(out, total_len);
    out.extend_from_slice(b"\r\n");
    out.extend_from_slice(encoding.as_bytes());
    out.push(b':');
@@ -48,28 +50,28 @@ pub fn write_verbatim_string(out: &mut Vec<u8>, encoding: &str, data: &str) {
 #[inline]
 pub fn write_map_header(out: &mut Vec<u8>, len: usize) {
    out.push(b'%');
-   super::resp::write_usize(out, len);
+   write_usize(out, len);
    out.extend_from_slice(b"\r\n");
 }
 
 #[inline]
 pub fn write_set_header(out: &mut Vec<u8>, len: usize) {
    out.push(b'~');
-   super::resp::write_usize(out, len);
+   write_usize(out, len);
    out.extend_from_slice(b"\r\n");
 }
 
 #[inline]
 pub fn write_push_header(out: &mut Vec<u8>, len: usize) {
    out.push(b'>');
-   super::resp::write_usize(out, len);
+   write_usize(out, len);
    out.extend_from_slice(b"\r\n");
 }
 
 #[inline]
 pub fn write_attribute_header(out: &mut Vec<u8>, len: usize) {
    out.push(b'|');
-   super::resp::write_usize(out, len);
+   write_usize(out, len);
    out.extend_from_slice(b"\r\n");
 }
 

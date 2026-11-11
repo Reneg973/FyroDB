@@ -8,9 +8,6 @@ use crate::pubsub::{PubSub, SubSlot, WorkerNotifier};
 use crate::storage::store::Store;
 use crate::utils::parser::{ParseResult, RespParser};
 
-use super::dispatch::dispatch;
-use super::subscription::do_full_unsubscribe;
-
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static NULL_STORE: AtomicBool = AtomicBool::new(false);
@@ -78,29 +75,29 @@ pub enum ConnMode {
 }
 
 pub struct Conn<'a> {
-   pub stream: Stream,
-   pub parser: RespParser,
-   pub store: &'a Arc<Store>,
-   pub pubsub: &'a PubSub,
-   pub write_offset: usize,
-   pub mode: ConnMode,
-   pub token: usize,
-   pub notifier: &'a Arc<WorkerNotifier>,
-   pub auth_required: Option<&'a str>,
-   pub authenticated: bool,
-   pub asking: bool,
-   pub writable_registered: bool,
-   pub worker: usize,
+   pub(crate) stream: Stream,
+   pub(crate) parser: RespParser,
+   pub(crate) mode: ConnMode,
+   pub(crate) writable_registered: bool,
+   pub(super) store: &'a Arc<Store>,
+   pub(super) pubsub: &'a PubSub,
+   pub(super) token: usize,
+   pub(super) notifier: &'a Arc<WorkerNotifier>,
+   pub(super) asking: bool,
+   auth_required: Option<&'a str>,
+   authenticated: bool,
+   write_offset: usize,
+   worker: usize,
    /// Process-unique id (tokens are recycled; this is not).
-   pub uid: u64,
+   uid: u64,
    /// Set while the current command waits off-worker or on a key.
-   pub park: Option<park::Parked>,
+   park: Option<park::Parked>,
    #[allow(dead_code)]
    hints: [prefetch::Hint; customhash::PREFETCH_BATCH],
    #[allow(dead_code)]
-   pub(crate) hint_n: u8,
+   pub(super) hint_n: u8,
    #[allow(dead_code)]
-   pub(crate) hint_idx: u8,
+   pub(super) hint_idx: u8,
    #[allow(dead_code)]
    pf_backoff: u8,
    topology_cache: Option<(
@@ -178,7 +175,7 @@ impl<'a> Conn<'a> {
 impl Drop for Conn<'_> {
    fn drop(&mut self) {
       self.unblock();
-      do_full_unsubscribe(self);
+      self.do_full_unsubscribe();
       self.store.client_disconnected();
    }
 }

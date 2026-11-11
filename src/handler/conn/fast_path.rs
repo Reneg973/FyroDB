@@ -1,20 +1,8 @@
 #![allow(clippy::collapsible_if)]
 
 use super::*;
-
-const OK_BLOCK: [u8; 256 * 5] = {
-   let mut b = [0u8; 256 * 5];
-   let mut i = 0;
-   while i < 256 * 5 {
-      b[i] = b'+';
-      b[i + 1] = b'O';
-      b[i + 2] = b'K';
-      b[i + 3] = b'\r';
-      b[i + 4] = b'\n';
-      i += 5;
-   }
-   b
-};
+use crate::utils::int_format::write_usize;
+use crate::utils::resp::write_boolean;
 
 /// Command identity resolved from one lowercased 8-byte window, so a command
 /// is classified once instead of being re-compared at every dispatch gate.
@@ -161,103 +149,137 @@ pub(super) fn cmd_id(cmd: &[u8]) -> CmdId {
    }
 }
 
-#[inline(always)]
-pub(super) fn dispatch_get_run(conn: &mut Conn<'_>, first_key: (*const u8, usize)) {
-   const BATCH: usize = 256;
-   let mut keys: [&[u8]; BATCH] = [&[]; BATCH];
-   let mut hashes = [0u64; BATCH];
-   let mut tables = [std::ptr::null(); BATCH];
-   let mut entries = [std::ptr::null(); BATCH];
+impl<'a> Conn<'a> {
+   #[inline(always)]
+   pub(super) fn dispatch_get_run(&mut self, first_key: (*const u8, usize)) {
+      const BATCH: usize = 256;
+      let mut keys: [&[u8]; BATCH] = [&[]; BATCH];
+      let mut hashes = [0u64; BATCH];
+      let mut tables = [std::ptr::null(); BATCH];
+      let mut entries = [std::ptr::null(); BATCH];
 
-   let k0_bytes = unsafe { std::slice::from_raw_parts(first_key.0, first_key.1) };
-   keys[0] = k0_bytes;
-   let mut count = 1;
+      let k0_bytes = unsafe { std::slice::from_raw_parts(first_key.0, first_key.1) };
+      keys[0] = k0_bytes;
+      let mut count = 1;
 
-   const T2: u32 = u32::from_ne_bytes(*b"*2\r\n");
-   while count < BATCH {
-      let avail = conn.parser.filled - conn.parser.pos;
-      if avail < 20 {
-         break;
-      }
-      let buf = unsafe { conn.parser.rbuf.as_ptr().add(conn.parser.pos) };
-      let tag = unsafe { std::ptr::read_unaligned(buf as *const u32) };
-      if tag != T2 {
-         break;
-      }
-      if let Some(k_ptr) = conn.parser.try_fast_get_key_at(buf, avail) {
-         keys[count] = unsafe { std::slice::from_raw_parts(k_ptr.0, k_ptr.1) };
-         count += 1;
-      } else {
-         break;
-      }
-   }
-
-   if is_null_store() {
-      let out = &mut conn.parser.wbuf;
-      out.reserve(count * 11);
-      const GET_REPLY_11: &[u8] = b"$5\r\nvalue\r\n";
-      let old_len = out.len();
-      unsafe {
-         out.set_len(old_len + count * 11);
-         let mut p = out.as_mut_ptr().add(old_len);
-         for _ in 0..count {
-            std::ptr::copy_nonoverlapping(GET_REPLY_11.as_ptr(), p, 11);
-            p = p.add(11);
+      const T2: u32 = u32::from_ne_bytes(*b"*2\r\n");
+      while count < BATCH {
+         let avail = self.parser.filled - self.parser.pos;
+         if avail < 20 {
+            break;
+         }
+         let buf = unsafe { self.parser.rbuf.as_ptr().add(self.parser.pos) };
+         let tag = unsafe { std::ptr::read_unaligned(buf as *const u32) };
+         if tag != T2 {
+            break;
+         }
+         if let Some(k_ptr) = self.parser.try_fast_get_key_at(buf, avail) {
+            keys[count] = unsafe { std::slice::from_raw_parts(k_ptr.0, k_ptr.1) };
+            count += 1;
+         } else {
+            break;
          }
       }
-      return;
-   }
 
-   if count == 1 {
-      let (hint, entry) = conn.hint_for(first_key);
-      let out = &mut conn.parser.wbuf;
-      if out.capacity().saturating_sub(out.len()) < 32 {
-         out.reserve(32);
-      }
-      let Some(key) = part_str(out, first_key) else {
+      if is_null_store() {
+         let out = &mut self.parser.wbuf;
+         out.reserve(count * 11);
+         const GET_REPLY_11: &[u8] = b"$5\r\nvalue\r\n";
+         let old_len = out.len();
+         unsafe {
+            out.set_len(old_len + count * 11);
+            let mut p = out.as_mut_ptr().add(old_len);
+            for _ in 0..count {
+               std::ptr::copy_nonoverlapping(GET_REPLY_11.as_ptr(), p, 11);
+               p = p.add(11);
+            }
+         }
          return;
-      };
-      if !conn.store.get_to_buf_auto(key, hint, entry, out) {
-         out.extend_from_slice(b"$-1\r\n");
       }
-      return;
-   }
 
-   conn
-      .store
-      .prefetch_slots(&keys[..count], &mut hashes[..count], &mut tables[..count]);
-   conn
-      .store
-      .probe_and_prefetch_entries(&tables[..count], &hashes[..count], &mut entries[..count]);
-   let out = &mut conn.parser.wbuf;
-   out.reserve(count * 64);
-   let old_len = out.len();
-   let mut out_ptr = unsafe { out.as_mut_ptr().add(old_len) };
-
-   let mut i = 0;
-   while i < count {
-      let mut end = i + 1;
-      while end < count && keys[end] == keys[i] {
-         end += 1;
+      if count == 1 {
+         let (hint, entry) = self.hint_for(first_key);
+         let out = &mut self.parser.wbuf;
+         if out.capacity().saturating_sub(out.len()) < 32 {
+            out.reserve(32);
+         }
+         let Some(key) = part_str(out, first_key) else {
+            return;
+         };
+         if !self.store.get_to_buf_auto(key, hint, entry, out) {
+            out.extend_from_slice(b"$-1\r\n");
+         }
+         return;
       }
-      let run_len = end - i;
 
-      let p = entries[i];
-      let mut found = false;
-      if !p.is_null() {
-         let e = unsafe { &*p.cast::<customhash::Entry<crate::storage::value::StoreValue>>() };
-         let state = e.state.load(std::sync::atomic::Ordering::Relaxed);
-         let expected = ((hashes[i] as u32 as u64) << 32) | customhash::STATE_OCCUPIED;
-         if (state & (0xFFFF_FFFF_0000_0000 | customhash::STATE_OCCUPIED)) == expected
-            && e.key.eq_bytes(keys[i])
-         {
-            if state & customhash::STATE_LOCK != 0 {
-               let mut cur = state;
-               while cur & customhash::STATE_LOCK != 0 {
-                  std::hint::spin_loop();
-                  cur = e.state.load(std::sync::atomic::Ordering::Acquire);
+      self
+        .store
+        .prefetch_slots(&keys[..count], &mut hashes[..count], &mut tables[..count]);
+      self
+        .store
+        .probe_and_prefetch_entries(&tables[..count], &hashes[..count], &mut entries[..count]);
+      let out = &mut self.parser.wbuf;
+      out.reserve(count * 64);
+      let old_len = out.len();
+      let mut out_ptr = unsafe { out.as_mut_ptr().add(old_len) };
+
+      let mut i = 0;
+      while i < count {
+         let mut end = i + 1;
+         while end < count && keys[end] == keys[i] {
+            end += 1;
+         }
+         let run_len = end - i;
+
+         let p = entries[i];
+         let mut found = false;
+         if !p.is_null() {
+            let e = unsafe { &*p.cast::<customhash::Entry<crate::storage::value::StoreValue>>() };
+            let state = e.state.load(Ordering::Relaxed);
+            let expected = ((hashes[i] as u32 as u64) << 32) | customhash::STATE_OCCUPIED;
+            if (state & (0xFFFF_FFFF_0000_0000 | customhash::STATE_OCCUPIED)) == expected
+              && e.key.eq_bytes(keys[i])
+            {
+               if state & customhash::STATE_LOCK != 0 {
+                  let mut cur = state;
+                  while cur & customhash::STATE_LOCK != 0 {
+                     std::hint::spin_loop();
+                     cur = e.state.load(Ordering::Acquire);
+                  }
+                  if cur & customhash::STATE_OCCUPIED == 0 {
+                     for _ in 0..run_len {
+                        unsafe {
+                           std::ptr::copy_nonoverlapping(b"$-1\r\n".as_ptr(), out_ptr, 5);
+                           out_ptr = out_ptr.add(5);
+                        }
+                     }
+                     i = end;
+                     continue;
+                  }
                }
-               if cur & customhash::STATE_OCCUPIED == 0 {
+               std::sync::atomic::fence(Ordering::Acquire);
+               let val = unsafe { (*e.value.get()).assume_init_ref() };
+               if val.expires_ms == 0 || !val.is_expired() {
+                  if let crate::storage::value::FyroDB::String(s) = &val.value {
+                     let written = unsafe { s.write_resp_raw(out_ptr) };
+                     if run_len > 1 {
+                        for step in 1..run_len {
+                           unsafe {
+                              std::ptr::copy_nonoverlapping(
+                                 out_ptr,
+                                 out_ptr.add(step * written),
+                                 written,
+                              );
+                           }
+                        }
+                     }
+                     out_ptr = unsafe { out_ptr.add(written * run_len) };
+                     found = true;
+                  }
+               } else {
+                  if let Ok(key_str) = std::str::from_utf8(keys[i]) {
+                     self.store.data.remove(key_str);
+                  }
                   for _ in 0..run_len {
                      unsafe {
                         std::ptr::copy_nonoverlapping(b"$-1\r\n".as_ptr(), out_ptr, 5);
@@ -268,752 +290,1171 @@ pub(super) fn dispatch_get_run(conn: &mut Conn<'_>, first_key: (*const u8, usize
                   continue;
                }
             }
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            let val = unsafe { (*e.value.get()).assume_init_ref() };
-            if val.expires_ms == 0 || !val.is_expired() {
-               if let crate::storage::value::FyroDB::String(s) = &val.value {
-                  let written = unsafe { s.write_resp_raw(out_ptr) };
-                  if run_len > 1 {
-                     for step in 1..run_len {
-                        unsafe {
-                           std::ptr::copy_nonoverlapping(
-                              out_ptr,
-                              out_ptr.add(step * written),
-                              written,
-                           );
-                        }
-                     }
-                  }
-                  out_ptr = unsafe { out_ptr.add(written * run_len) };
-                  found = true;
-               }
-            } else {
-               if let Ok(key_str) = std::str::from_utf8(keys[i]) {
-                  conn.store.data.remove(key_str);
-               }
+         }
+         if !found {
+            unsafe {
+               out.set_len(out_ptr.offset_from(out.as_ptr()) as usize);
+            }
+            let Ok(key_str) = std::str::from_utf8(keys[i]) else {
                for _ in 0..run_len {
-                  unsafe {
-                     std::ptr::copy_nonoverlapping(b"$-1\r\n".as_ptr(), out_ptr, 5);
-                     out_ptr = out_ptr.add(5);
-                  }
+                  crate::utils::resp::write_err(out, "invalid UTF-8 in request");
                }
+               out_ptr = unsafe { out.as_mut_ptr().add(out.len()) };
                i = end;
                continue;
+            };
+            let start_offset = out.len();
+            if !self
+              .store
+              .get_to_buf_auto(key_str, Some(hashes[i]), entries[i], out)
+            {
+               out.extend_from_slice(b"$-1\r\n");
             }
-         }
-      }
-      if !found {
-         unsafe {
-            out.set_len(out_ptr.offset_from(out.as_ptr()) as usize);
-         }
-         let Ok(key_str) = std::str::from_utf8(keys[i]) else {
-            for _ in 0..run_len {
-               crate::utils::resp::write_err(out, "invalid UTF-8 in request");
+            let single_len = out.len() - start_offset;
+            if run_len > 1 {
+               let add_bytes = (run_len - 1) * single_len;
+               out.reserve(add_bytes);
+               let src = unsafe { out.as_ptr().add(start_offset) };
+               let mut dst = unsafe { out.as_mut_ptr().add(out.len()) };
+               for _ in 1..run_len {
+                  unsafe {
+                     std::ptr::copy_nonoverlapping(src, dst, single_len);
+                     dst = dst.add(single_len);
+                  }
+               }
+               unsafe {
+                  out.set_len(out.len() + add_bytes);
+               }
             }
             out_ptr = unsafe { out.as_mut_ptr().add(out.len()) };
-            i = end;
-            continue;
+         }
+         i = end;
+      }
+      unsafe {
+         out.set_len(out_ptr.offset_from(out.as_ptr()) as usize);
+      }
+   }
+
+   #[inline(always)]
+   pub(super) fn dispatch_set_run(
+      &mut self,
+      first_key: (*const u8, usize),
+      first_val: (*const u8, usize),
+   ) {
+      const BATCH: usize = 256;
+      let mut keys: [&[u8]; BATCH] = [&[]; BATCH];
+      let mut vals: [(*const u8, usize); BATCH] = [(std::ptr::null(), 0); BATCH];
+      let mut hashes = [0u64; BATCH];
+      let mut tables = [std::ptr::null(); BATCH];
+      let mut entries = [std::ptr::null(); BATCH];
+
+      let k0_bytes = unsafe { std::slice::from_raw_parts(first_key.0, first_key.1) };
+      keys[0] = k0_bytes;
+      vals[0] = first_val;
+      let mut count = 1;
+
+      const T3: u32 = u32::from_ne_bytes(*b"*3\r\n");
+      while count < BATCH {
+         let avail = self.parser.filled - self.parser.pos;
+         if avail < 24 {
+            break;
+         }
+         let buf = unsafe { self.parser.rbuf.as_ptr().add(self.parser.pos) };
+         let tag = unsafe { std::ptr::read_unaligned(buf as *const u32) };
+         if tag != T3 {
+            break;
+         }
+         if let Some((k_ptr, v_ptr)) = self.parser.try_fast_set_key_val_at(buf, avail) {
+            keys[count] = unsafe { std::slice::from_raw_parts(k_ptr.0, k_ptr.1) };
+            vals[count] = v_ptr;
+            count += 1;
+         } else {
+            break;
+         }
+      }
+
+      if is_null_store() {
+         let out = &mut self.parser.wbuf;
+         write_ok_batch_at(out, out.len(), count);
+         return;
+      }
+
+      if count == 1 {
+         let (hint, entry) = self.hint_for(first_key);
+         let out = &mut self.parser.wbuf;
+         let Some(key) = part_str(out, first_key) else {
+            return;
          };
-         let start_offset = out.len();
-         if !conn
-            .store
-            .get_to_buf_auto(key_str, Some(hashes[i]), entries[i], out)
-         {
-            out.extend_from_slice(b"$-1\r\n");
+         let Some(value) = part_str(out, first_val) else {
+            return;
+         };
+         self.store.set_string_auto(key, hint, entry, value, 0);
+         if self.store.has_replication() {
+            self.store.record_current_value(key);
          }
-         let single_len = out.len() - start_offset;
-         if run_len > 1 {
-            let add_bytes = (run_len - 1) * single_len;
-            out.reserve(add_bytes);
-            let src = unsafe { out.as_ptr().add(start_offset) };
-            let mut dst = unsafe { out.as_mut_ptr().add(out.len()) };
-            for _ in 1..run_len {
-               unsafe {
-                  std::ptr::copy_nonoverlapping(src, dst, single_len);
-                  dst = dst.add(single_len);
-               }
-            }
-            unsafe {
-               out.set_len(out.len() + add_bytes);
-            }
-         }
-         out_ptr = unsafe { out.as_mut_ptr().add(out.len()) };
+         out.extend_from_slice(b"+OK\r\n");
+         return;
       }
-      i = end;
-   }
-   unsafe {
-      out.set_len(out_ptr.offset_from(out.as_ptr()) as usize);
-   }
-}
 
-#[inline(always)]
-pub(super) fn dispatch_set_run(
-   conn: &mut Conn<'_>,
-   first_key: (*const u8, usize),
-   first_val: (*const u8, usize),
-) {
-   const BATCH: usize = 256;
-   let mut keys: [&[u8]; BATCH] = [&[]; BATCH];
-   let mut vals: [(*const u8, usize); BATCH] = [(std::ptr::null(), 0); BATCH];
-   let mut hashes = [0u64; BATCH];
-   let mut tables = [std::ptr::null(); BATCH];
-   let mut entries = [std::ptr::null(); BATCH];
-
-   let k0_bytes = unsafe { std::slice::from_raw_parts(first_key.0, first_key.1) };
-   keys[0] = k0_bytes;
-   vals[0] = first_val;
-   let mut count = 1;
-
-   const T3: u32 = u32::from_ne_bytes(*b"*3\r\n");
-   while count < BATCH {
-      let avail = conn.parser.filled - conn.parser.pos;
-      if avail < 24 {
-         break;
-      }
-      let buf = unsafe { conn.parser.rbuf.as_ptr().add(conn.parser.pos) };
-      let tag = unsafe { std::ptr::read_unaligned(buf as *const u32) };
-      if tag != T3 {
-         break;
-      }
-      if let Some((k_ptr, v_ptr)) = conn.parser.try_fast_set_key_val_at(buf, avail) {
-         keys[count] = unsafe { std::slice::from_raw_parts(k_ptr.0, k_ptr.1) };
-         vals[count] = v_ptr;
-         count += 1;
-      } else {
-         break;
-      }
-   }
-
-   if is_null_store() {
-      let out = &mut conn.parser.wbuf;
+      self
+        .store
+        .prefetch_slots_write(&keys[..count], &mut hashes[..count], &mut tables[..count]);
+      self.store.probe_and_prefetch_entries_write(
+         &tables[..count],
+         &hashes[..count],
+         &mut entries[..count],
+      );
+      let out = &mut self.parser.wbuf;
       out.reserve(count * 5);
       let old_len = out.len();
-      unsafe {
-         out.set_len(old_len + count * 5);
-         std::ptr::copy_nonoverlapping(OK_BLOCK.as_ptr(), out.as_mut_ptr().add(old_len), count * 5);
-      }
-      return;
-   }
+      let mut success = true;
+      let mut i = 0;
+      while i < count {
+         let mut end = i + 1;
+         while end < count && keys[end] == keys[i] {
+            end += 1;
+         }
 
-   if count == 1 {
-      let (hint, entry) = conn.hint_for(first_key);
-      let out = &mut conn.parser.wbuf;
-      let Some(key) = part_str(out, first_key) else {
-         return;
-      };
-      let Some(value) = part_str(out, first_val) else {
-         return;
-      };
-      conn.store.set_string_auto(key, hint, entry, value, 0);
-      if conn.store.has_replication() {
-         conn.store.record_current_value(key);
-      }
-      out.extend_from_slice(b"+OK\r\n");
-      return;
-   }
-
-   conn
-      .store
-      .prefetch_slots_write(&keys[..count], &mut hashes[..count], &mut tables[..count]);
-   conn.store.probe_and_prefetch_entries_write(
-      &tables[..count],
-      &hashes[..count],
-      &mut entries[..count],
-   );
-   let out = &mut conn.parser.wbuf;
-   out.reserve(count * 5);
-   let old_len = out.len();
-   let mut success = true;
-   let mut i = 0;
-   while i < count {
-      let mut end = i + 1;
-      while end < count && keys[end] == keys[i] {
-         end += 1;
-      }
-
-      let p = entries[i];
-      let mut updated = false;
-      if !p.is_null() && !conn.store.has_replication() {
-         let e = unsafe { &*p.cast::<customhash::Entry<crate::storage::value::StoreValue>>() };
-         let mut current = e.state.load(std::sync::atomic::Ordering::Relaxed);
-         let expected = ((hashes[i] as u32 as u64) << 32) | customhash::STATE_OCCUPIED;
-         if (current & (0xFFFF_FFFF_0000_0000 | customhash::STATE_OCCUPIED)) == expected
-            && e.key.eq_bytes(keys[i])
-         {
-            let last_val = vals[end - 1];
-            let val_bytes = unsafe { std::slice::from_raw_parts(last_val.0, last_val.1) };
-            let mut backoff = 1u32;
-            for _ in 0..32 {
-               while current & customhash::STATE_LOCK != 0 {
-                  for _ in 0..backoff {
-                     std::hint::spin_loop();
-                  }
-                  if backoff < 64 {
-                     backoff <<= 1;
-                  }
-                  current = e.state.load(std::sync::atomic::Ordering::Relaxed);
-               }
-               if (current & customhash::STATE_OCCUPIED) == 0 {
-                  break;
-               }
-               let locked = customhash::bump_seq(current) | customhash::STATE_LOCK;
-               match e.state.compare_exchange_weak(
-                  current,
-                  locked,
-                  std::sync::atomic::Ordering::Acquire,
-                  std::sync::atomic::Ordering::Relaxed,
-               ) {
-                  Ok(_) => {
-                     conn.store.data.snap_before_write(e);
-                     let val = unsafe { (*e.value.get()).assume_init_mut() };
-                     val.expires_ms = 0;
-                     if let crate::storage::value::FyroDB::String(ref mut s) = val.value {
-                        s.overwrite_bytes(val_bytes);
-                     } else {
-                        val.value = crate::storage::value::FyroDB::String(
-                           crate::storage::value::SmallStr::from_slice(val_bytes),
-                        );
-                     }
-                     let unlocked = (customhash::bump_seq(locked) & !customhash::STATE_LOCK)
-                        | customhash::STATE_OCCUPIED;
-                     e.state
-                        .store(unlocked, std::sync::atomic::Ordering::Release);
-                     conn.store.data.touched_bytes(keys[i]);
-                     updated = true;
-                     break;
-                  }
-                  Err(observed) => {
-                     current = observed;
+         let p = entries[i];
+         let mut updated = false;
+         if !p.is_null() && !self.store.has_replication() {
+            let e = unsafe { &*p.cast::<customhash::Entry<crate::storage::value::StoreValue>>() };
+            let mut current = e.state.load(Ordering::Relaxed);
+            let expected = ((hashes[i] as u32 as u64) << 32) | customhash::STATE_OCCUPIED;
+            if (current & (0xFFFF_FFFF_0000_0000 | customhash::STATE_OCCUPIED)) == expected
+              && e.key.eq_bytes(keys[i])
+            {
+               let last_val = vals[end - 1];
+               let val_bytes = unsafe { std::slice::from_raw_parts(last_val.0, last_val.1) };
+               let mut backoff = 1u32;
+               for _ in 0..32 {
+                  while current & customhash::STATE_LOCK != 0 {
                      for _ in 0..backoff {
                         std::hint::spin_loop();
                      }
                      if backoff < 64 {
                         backoff <<= 1;
                      }
+                     current = e.state.load(Ordering::Relaxed);
+                  }
+                  if (current & customhash::STATE_OCCUPIED) == 0 {
+                     break;
+                  }
+                  let locked = customhash::bump_seq(current) | customhash::STATE_LOCK;
+                  match e.state.compare_exchange_weak(
+                     current,
+                     locked,
+                     Ordering::Acquire,
+                     Ordering::Relaxed,
+                  ) {
+                     Ok(_) => {
+                        self.store.data.snap_before_write(e);
+                        let val = unsafe { (*e.value.get()).assume_init_mut() };
+                        val.expires_ms = 0;
+                        if let crate::storage::value::FyroDB::String(ref mut s) = val.value {
+                           s.overwrite_bytes(val_bytes);
+                        } else {
+                           val.value = crate::storage::value::FyroDB::String(
+                              crate::storage::value::SmallStr::from_slice(val_bytes),
+                           );
+                        }
+                        let unlocked = (customhash::bump_seq(locked) & !customhash::STATE_LOCK)
+                          | customhash::STATE_OCCUPIED;
+                        e.state.store(unlocked, Ordering::Release);
+                        self.store.data.touched_bytes(keys[i]);
+                        updated = true;
+                        break;
+                     }
+                     Err(observed) => {
+                        current = observed;
+                        for _ in 0..backoff {
+                           std::hint::spin_loop();
+                        }
+                        if backoff < 64 {
+                           backoff <<= 1;
+                        }
+                     }
                   }
                }
             }
          }
-      }
 
-      if !updated {
-         for k in i..end {
-            let Ok(key_str) = std::str::from_utf8(keys[k]) else {
-               crate::utils::resp::write_err(out, "invalid UTF-8 in request");
-               success = false;
-               continue;
-            };
-            let val_bytes = unsafe { std::slice::from_raw_parts(vals[k].0, vals[k].1) };
-            if entries[k].is_null() && !conn.store.has_replication() {
-               conn
-                  .store
-                  .set_string_fast_bytes(key_str, hashes[k], val_bytes);
-            } else {
+         if !updated {
+            for k in i..end {
+               let Ok(key_str) = std::str::from_utf8(keys[k]) else {
+                  crate::utils::resp::write_err(out, "invalid UTF-8 in request");
+                  success = false;
+                  continue;
+               };
+               let val_bytes = unsafe { std::slice::from_raw_parts(vals[k].0, vals[k].1) };
+               if entries[k].is_null() && !self.store.has_replication() {
+                  self
+                    .store
+                    .set_string_fast_bytes(key_str, hashes[k], val_bytes);
+                  continue;
+               }
                let Ok(val_str) = std::str::from_utf8(val_bytes) else {
                   crate::utils::resp::write_err(out, "invalid UTF-8 in request");
                   success = false;
                   continue;
                };
-               conn
-                  .store
-                  .set_string_auto(key_str, Some(hashes[k]), entries[k], val_str, 0);
-               if conn.store.has_replication() {
-                  conn.store.record_current_value(key_str);
+               self
+                 .store
+                 .set_string_auto(key_str, Some(hashes[k]), entries[k], val_str, 0);
+               if self.store.has_replication() {
+                  self.store.record_current_value(key_str);
                }
             }
          }
+         i = end;
       }
-      i = end;
-   }
-   if success {
-      unsafe {
-         out.set_len(old_len + count * 5);
-         std::ptr::copy_nonoverlapping(OK_BLOCK.as_ptr(), out.as_mut_ptr().add(old_len), count * 5);
-      }
-   }
-}
-
-pub(super) fn dispatch_json_set_run(conn: &mut Conn<'_>, first_raw: &[(*const u8, usize)]) -> bool {
-   if first_raw.len() != 4 {
-      return false;
-   }
-   let first_path = unsafe { part_bytes(first_raw[2]) };
-   if first_path != b"." {
-      return false;
-   }
-   const BATCH: usize = 256;
-   let mut keys: [&[u8]; BATCH] = [&[]; BATCH];
-   let mut vals: [(*const u8, usize); BATCH] = [(std::ptr::null(), 0); BATCH];
-   let mut hashes = [0u64; BATCH];
-   let mut tables = [std::ptr::null(); BATCH];
-   let mut entries = [std::ptr::null(); BATCH];
-
-   keys[0] = unsafe { part_bytes(first_raw[1]) };
-   vals[0] = first_raw[3];
-   let mut count = 1;
-
-   while count < BATCH {
-      let avail = conn.parser.filled - conn.parser.pos;
-      if avail < 32 {
-         break;
-      }
-      let buf = unsafe { conn.parser.rbuf.as_ptr().add(conn.parser.pos) };
-      if let Some((k_ptr, v_ptr)) = conn.parser.try_fast_json_set_key_val_at(buf, avail) {
-         keys[count] = unsafe { std::slice::from_raw_parts(k_ptr.0, k_ptr.1) };
-         vals[count] = v_ptr;
-         count += 1;
-      } else {
-         break;
+      if success {
+         write_ok_batch_at(out, old_len, count);
       }
    }
 
-   if count == 1 {
-      let (hint, entry) = conn.hint_for(first_raw[1]);
-      let out = &mut conn.parser.wbuf;
-      let Some(key) = part_str(out, first_raw[1]) else {
+   pub(super) fn dispatch_json_set_run(&mut self, first_raw: &[(*const u8, usize)]) -> bool {
+      if first_raw.len() != 4 {
          return false;
-      };
-      let Some(val) = part_str(out, first_raw[3]) else {
+      }
+      let first_path = unsafe { part_bytes(first_raw[2]) };
+      if first_path != b"." {
          return false;
-      };
-      conn.store.set_json_auto(key, hint, entry, val);
-      if conn.store.has_replication() {
-         conn.store.record_current_value(key);
       }
-      crate::utils::resp::write_ok(out);
-      return true;
-   }
+      const BATCH: usize = 256;
+      let mut keys: [&[u8]; BATCH] = [&[]; BATCH];
+      let mut vals: [(*const u8, usize); BATCH] = [(std::ptr::null(), 0); BATCH];
+      let mut hashes = [0u64; BATCH];
+      let mut tables = [std::ptr::null(); BATCH];
+      let mut entries = [std::ptr::null(); BATCH];
 
-   conn
-      .store
-      .prefetch_slots_write(&keys[..count], &mut hashes[..count], &mut tables[..count]);
-   conn.store.probe_and_prefetch_entries_write(
-      &tables[..count],
-      &hashes[..count],
-      &mut entries[..count],
-   );
+      keys[0] = unsafe { part_bytes(first_raw[1]) };
+      vals[0] = first_raw[3];
+      let mut count = 1;
 
-   let out = &mut conn.parser.wbuf;
-   out.reserve(count * 5);
-   let old_len = out.len();
-   let mut success = true;
-
-   for i in 0..count {
-      let Ok(key_str) = std::str::from_utf8(keys[i]) else {
-         crate::utils::resp::write_err(out, "invalid UTF-8 in request");
-         success = false;
-         continue;
-      };
-      let val_bytes = unsafe { std::slice::from_raw_parts(vals[i].0, vals[i].1) };
-      let Ok(val_str) = std::str::from_utf8(val_bytes) else {
-         crate::utils::resp::write_err(out, "invalid UTF-8 in request");
-         success = false;
-         continue;
-      };
-      conn
-         .store
-         .set_json_auto(key_str, Some(hashes[i]), entries[i], val_str);
-      if conn.store.has_replication() {
-         conn.store.record_current_value(key_str);
-      }
-   }
-
-   if success {
-      const OK_REPLY_5: &[u8] = b"+OK\r\n";
-      unsafe {
-         out.set_len(old_len + count * 5);
-         let mut p = out.as_mut_ptr().add(old_len);
-         for _ in 0..count {
-            std::ptr::copy_nonoverlapping(OK_REPLY_5.as_ptr(), p, 5);
-            p = p.add(5);
+      while count < BATCH {
+         let avail = self.parser.filled - self.parser.pos;
+         if avail < 32 {
+            break;
+         }
+         let buf = unsafe { self.parser.rbuf.as_ptr().add(self.parser.pos) };
+         if let Some((k_ptr, v_ptr)) = self.parser.try_fast_json_set_key_val_at(buf, avail) {
+            keys[count] = unsafe { std::slice::from_raw_parts(k_ptr.0, k_ptr.1) };
+            vals[count] = v_ptr;
+            count += 1;
+         } else {
+            break;
          }
       }
-   }
-   true
-}
 
-pub(super) fn dispatch_json_get_run(conn: &mut Conn<'_>, first_raw: &[(*const u8, usize)]) -> bool {
-   if first_raw.len() != 3 {
-      return false;
-   }
-   let path = unsafe { part_bytes(first_raw[2]) };
-   if path != b"." {
-      return false;
-   }
-   const BATCH: usize = 256;
-   let mut keys: [&[u8]; BATCH] = [&[]; BATCH];
-   let mut hashes = [0u64; BATCH];
-   let mut tables = [std::ptr::null(); BATCH];
-   let mut entries = [std::ptr::null(); BATCH];
-
-   keys[0] = unsafe { part_bytes(first_raw[1]) };
-   let mut count = 1;
-
-   while count < BATCH {
-      let avail = conn.parser.filled - conn.parser.pos;
-      if avail < 24 {
-         break;
-      }
-      let buf = unsafe { conn.parser.rbuf.as_ptr().add(conn.parser.pos) };
-      if let Some(k_ptr) = conn.parser.try_fast_json_get_key_at(buf, avail) {
-         keys[count] = unsafe { std::slice::from_raw_parts(k_ptr.0, k_ptr.1) };
-         count += 1;
-      } else {
-         break;
-      }
-   }
-
-   if count == 1 {
-      let out = &mut conn.parser.wbuf;
-      let Some(key) = part_str(out, first_raw[1]) else {
-         return false;
-      };
-      match conn.store.json_get_to_buf(key, &["."], out) {
-         Ok(true) => {}
-         Ok(false) => crate::utils::resp::write_nil(out),
-         Err(e) => crate::utils::resp::write_store_err(out, e),
-      }
-      return true;
-   }
-
-   conn
-      .store
-      .prefetch_slots(&keys[..count], &mut hashes[..count], &mut tables[..count]);
-   conn
-      .store
-      .probe_and_prefetch_entries(&tables[..count], &hashes[..count], &mut entries[..count]);
-
-   let out = &mut conn.parser.wbuf;
-   out.reserve(count * 64);
-   let old_len = out.len();
-   let mut out_ptr = unsafe { out.as_mut_ptr().add(old_len) };
-
-   for i in 0..count {
-      let p = entries[i];
-      let mut found = false;
-      if !p.is_null() {
-         let e = unsafe { &*p.cast::<customhash::Entry<crate::storage::value::StoreValue>>() };
-         let state = e.state.load(std::sync::atomic::Ordering::Relaxed);
-         let expected = ((hashes[i] as u32 as u64) << 32) | customhash::STATE_OCCUPIED;
-         if (state & (0xFFFF_FFFF_0000_0000 | customhash::STATE_OCCUPIED)) == expected
-            && e.key.eq_bytes(keys[i])
-         {
-            if state & customhash::STATE_LOCK != 0 {
-               let mut cur = state;
-               while cur & customhash::STATE_LOCK != 0 {
-                  std::hint::spin_loop();
-                  cur = e.state.load(std::sync::atomic::Ordering::Acquire);
-               }
-               if cur & customhash::STATE_OCCUPIED == 0 {
-                  unsafe {
-                     std::ptr::copy_nonoverlapping(b"$-1\r\n".as_ptr(), out_ptr, 5);
-                     out_ptr = out_ptr.add(5);
-                  }
-                  continue;
-               }
-            }
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            let val = unsafe { (*e.value.get()).assume_init_ref() };
-            if val.expires_ms == 0 || !val.is_expired() {
-               if let Some(raw) = val.value.as_json_str() {
-                  let written =
-                     unsafe { crate::utils::resp::write_bulk_raw(out_ptr, raw.as_bytes()) };
-                  out_ptr = unsafe { out_ptr.add(written) };
-                  found = true;
-               }
-            }
+      if count == 1 {
+         let (hint, entry) = self.hint_for(first_raw[1]);
+         let out = &mut self.parser.wbuf;
+         let Some(key) = part_str(out, first_raw[1]) else {
+            return false;
+         };
+         let Some(val) = part_str(out, first_raw[3]) else {
+            return false;
+         };
+         self.store.set_json_auto(key, hint, entry, val);
+         if self.store.has_replication() {
+            self.store.record_current_value(key);
          }
+         crate::utils::resp::write_ok(out);
+         return true;
       }
-      if !found {
-         unsafe {
-            out.set_len(out_ptr.offset_from(out.as_ptr()) as usize);
-         }
+
+      self
+        .store
+        .prefetch_slots_write(&keys[..count], &mut hashes[..count], &mut tables[..count]);
+      self.store.probe_and_prefetch_entries_write(
+         &tables[..count],
+         &hashes[..count],
+         &mut entries[..count],
+      );
+
+      let out = &mut self.parser.wbuf;
+      out.reserve(count * 5);
+      let old_len = out.len();
+      let mut success = true;
+
+      for i in 0..count {
          let Ok(key_str) = std::str::from_utf8(keys[i]) else {
             crate::utils::resp::write_err(out, "invalid UTF-8 in request");
-            out_ptr = unsafe { out.as_mut_ptr().add(out.len()) };
+            success = false;
             continue;
          };
-         match conn.store.json_get_to_buf(key_str, &["."], out) {
+         let val_bytes = unsafe { std::slice::from_raw_parts(vals[i].0, vals[i].1) };
+         let Ok(val_str) = std::str::from_utf8(val_bytes) else {
+            crate::utils::resp::write_err(out, "invalid UTF-8 in request");
+            success = false;
+            continue;
+         };
+         self
+           .store
+           .set_json_auto(key_str, Some(hashes[i]), entries[i], val_str);
+         if self.store.has_replication() {
+            self.store.record_current_value(key_str);
+         }
+      }
+
+      if success {
+         const OK_REPLY_5: &[u8] = b"+OK\r\n";
+         unsafe {
+            out.set_len(old_len + count * 5);
+            let mut p = out.as_mut_ptr().add(old_len);
+            for _ in 0..count {
+               std::ptr::copy_nonoverlapping(OK_REPLY_5.as_ptr(), p, 5);
+               p = p.add(5);
+            }
+         }
+      }
+      true
+   }
+
+   pub(super) fn dispatch_json_get_run(&mut self, first_raw: &[(*const u8, usize)]) -> bool {
+      if first_raw.len() != 3 {
+         return false;
+      }
+      let path = unsafe { part_bytes(first_raw[2]) };
+      if path != b"." {
+         return false;
+      }
+      const BATCH: usize = 256;
+      let mut keys: [&[u8]; BATCH] = [&[]; BATCH];
+      let mut hashes = [0u64; BATCH];
+      let mut tables = [std::ptr::null(); BATCH];
+      let mut entries = [std::ptr::null(); BATCH];
+
+      keys[0] = unsafe { part_bytes(first_raw[1]) };
+      let mut count = 1;
+
+      while count < BATCH {
+         let avail = self.parser.filled - self.parser.pos;
+         if avail < 24 {
+            break;
+         }
+         let buf = unsafe { self.parser.rbuf.as_ptr().add(self.parser.pos) };
+         if let Some(k_ptr) = self.parser.try_fast_json_get_key_at(buf, avail) {
+            keys[count] = unsafe { std::slice::from_raw_parts(k_ptr.0, k_ptr.1) };
+            count += 1;
+         } else {
+            break;
+         }
+      }
+
+      if count == 1 {
+         let out = &mut self.parser.wbuf;
+         let Some(key) = part_str(out, first_raw[1]) else {
+            return false;
+         };
+         match self.store.json_get_to_buf(key, &["."], out) {
             Ok(true) => {}
             Ok(false) => crate::utils::resp::write_nil(out),
             Err(e) => crate::utils::resp::write_store_err(out, e),
          }
-         out_ptr = unsafe { out.as_mut_ptr().add(out.len()) };
+         return true;
       }
-   }
-   unsafe {
-      out.set_len(out_ptr.offset_from(out.as_ptr()) as usize);
-   }
-   true
-}
 
-#[inline]
-pub(super) fn dispatch_raw(conn: &mut Conn<'_>, raw: &[(*const u8, usize)]) {
-   if raw.is_empty() {
-      return;
+      self
+        .store
+        .prefetch_slots(&keys[..count], &mut hashes[..count], &mut tables[..count]);
+      self
+        .store
+        .probe_and_prefetch_entries(&tables[..count], &hashes[..count], &mut entries[..count]);
+
+      let out = &mut self.parser.wbuf;
+      out.reserve(count * 64);
+      let old_len = out.len();
+      let mut out_ptr = unsafe { out.as_mut_ptr().add(old_len) };
+
+      for i in 0..count {
+         let p = entries[i];
+         let mut found = false;
+         if !p.is_null() {
+            let e = unsafe { &*p.cast::<customhash::Entry<crate::storage::value::StoreValue>>() };
+            let state = e.state.load(Ordering::Relaxed);
+            let expected = ((hashes[i] as u32 as u64) << 32) | customhash::STATE_OCCUPIED;
+            if (state & (0xFFFF_FFFF_0000_0000 | customhash::STATE_OCCUPIED)) == expected
+              && e.key.eq_bytes(keys[i])
+            {
+               if state & customhash::STATE_LOCK != 0 {
+                  let mut cur = state;
+                  while cur & customhash::STATE_LOCK != 0 {
+                     std::hint::spin_loop();
+                     cur = e.state.load(Ordering::Acquire);
+                  }
+                  if cur & customhash::STATE_OCCUPIED == 0 {
+                     unsafe {
+                        std::ptr::copy_nonoverlapping(b"$-1\r\n".as_ptr(), out_ptr, 5);
+                        out_ptr = out_ptr.add(5);
+                     }
+                     continue;
+                  }
+               }
+               std::sync::atomic::fence(Ordering::Acquire);
+               let val = unsafe { (*e.value.get()).assume_init_ref() };
+               if val.expires_ms == 0 || !val.is_expired() {
+                  if let Some(raw) = val.value.as_json_str() {
+                     let written =
+                       unsafe { crate::utils::resp::write_bulk_raw(out_ptr, raw.as_bytes()) };
+                     out_ptr = unsafe { out_ptr.add(written) };
+                     found = true;
+                  }
+               }
+            }
+         }
+         if !found {
+            unsafe {
+               out.set_len(out_ptr.offset_from(out.as_ptr()) as usize);
+            }
+            let Ok(key_str) = std::str::from_utf8(keys[i]) else {
+               crate::utils::resp::write_err(out, "invalid UTF-8 in request");
+               out_ptr = unsafe { out.as_mut_ptr().add(out.len()) };
+               continue;
+            };
+            match self.store.json_get_to_buf(key_str, &["."], out) {
+               Ok(true) => {}
+               Ok(false) => crate::utils::resp::write_nil(out),
+               Err(e) => crate::utils::resp::write_store_err(out, e),
+            }
+            out_ptr = unsafe { out.as_mut_ptr().add(out.len()) };
+         }
+      }
+      unsafe {
+         out.set_len(out_ptr.offset_from(out.as_ptr()) as usize);
+      }
+      true
    }
 
-   let cmd_len = raw[0].1;
-   let cmd: &[u8] = unsafe { part_bytes(raw[0]) };
-   let id = cmd_id(cmd);
+   #[inline]
+   pub(super) fn dispatch_raw(&mut self, raw: &[(*const u8, usize)]) {
+      if raw.is_empty() {
+         return;
+      }
 
-   if is_null_store() {
-      let out = &mut conn.parser.wbuf;
-      if id == CmdId::Get {
-         out.extend_from_slice(b"$5\r\nvalue\r\n");
-      } else if id == CmdId::Ping {
-         out.extend_from_slice(b"+PONG\r\n");
+      let cmd_len = raw[0].1;
+      let cmd: &[u8] = unsafe { part_bytes(raw[0]) };
+      let id = cmd_id(cmd);
+
+      if is_null_store() {
+         let out = &mut self.parser.wbuf;
+         if id == CmdId::Get {
+            out.extend_from_slice(b"$5\r\nvalue\r\n");
+         } else if id == CmdId::Ping {
+            out.extend_from_slice(b"+PONG\r\n");
+         } else {
+            out.extend_from_slice(b"+OK\r\n");
+         }
+         return;
+      }
+
+      if !self.authenticated {
+         self.handle_unauth(raw, cmd);
+         return;
+      }
+
+      if id == CmdId::Auth {
+         self.handle_auth(raw);
+         return;
+      } else if id == CmdId::Hello {
+         self.handle_hello(raw);
+         return;
+      }
+
+      if !self.store.cluster.enabled && !self.store.at_key_capacity() {
+         match id {
+            CmdId::Get if raw.len() == 2 => {
+               self.dispatch_get_run(raw[1]);
+               return;
+            }
+            CmdId::Set if raw.len() == 3 => {
+               self.dispatch_set_run(raw[1], raw[2]);
+               return;
+            }
+            CmdId::Del if raw.len() == 2 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               write_boolean(out, self.store.del(key));
+               return;
+            }
+            CmdId::Hget if raw.len() == 3 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let Some(field) = part_str(out, raw[2]) else {
+                  return;
+               };
+               match self.store.hget_to_buf(key, field, out) {
+                  Ok(true) => {}
+                  Ok(false) => crate::utils::resp::write_nil(out),
+                  Err(_) => crate::utils::resp::write_wrong_type(out),
+               }
+               return;
+            }
+            CmdId::Hset if raw.len() == 4 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let pair = [(unsafe { part_bytes(raw[2]) }, unsafe { part_bytes(raw[3]) })];
+               crate::commands::hash::hset_raw(key, &pair, self.store, out);
+               if self.store.has_replication() {
+                  self.store.record_current_value(key);
+               }
+               return;
+            }
+            CmdId::Ping => {
+               if raw.len() == 1 {
+                  self.parser.wbuf.extend_from_slice(crate::utils::resp::PONG);
+                  return;
+               } else if raw.len() == 2 {
+                  let msg = unsafe { part_bytes(raw[1]) };
+                  crate::utils::resp::write_bulk_bytes(&mut self.parser.wbuf, msg);
+                  return;
+               }
+            }
+            CmdId::Incr if raw.len() == 2 => {
+               let (hint, _) = self.hint_for(raw[1]);
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               match self.store.incr_hinted(key, hint) {
+                  Ok(n) => {
+                     if self.store.has_replication() {
+                        self.store.record_current_value(key);
+                     }
+                     crate::utils::resp::write_integer(out, n)
+                  }
+                  Err(e) => crate::utils::resp::write_err(out, e),
+               }
+               return;
+            }
+            CmdId::Rpop if raw.len() == 2 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               match self.store.pop_one_to_buf(key, true, out) {
+                  Ok(true) => {
+                     if self.store.has_replication() {
+                        self.store.record_current_value(key);
+                     }
+                  }
+                  Ok(false) => out.extend_from_slice(b"$-1\r\n"),
+                  Err(_) => crate::utils::resp::write_wrong_type(out),
+               }
+               return;
+            }
+            CmdId::Lpop if raw.len() == 2 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               match self.store.pop_one_to_buf(key, false, out) {
+                  Ok(true) => {
+                     if self.store.has_replication() {
+                        self.store.record_current_value(key);
+                     }
+                  }
+                  Ok(false) => out.extend_from_slice(b"$-1\r\n"),
+                  Err(_) => crate::utils::resp::write_wrong_type(out),
+               }
+               return;
+            }
+            CmdId::Sadd if raw.len() == 3 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let Some(member) = part_str(out, raw[2]) else {
+                  return;
+               };
+               match self.store.sadd(key, &[member]) {
+                  Ok(n) => {
+                     if self.store.has_replication() {
+                        self.store.record_current_value(key);
+                     }
+                     crate::utils::resp::write_integer(out, n as i64)
+                  }
+                  Err(_) => crate::utils::resp::write_wrong_type(out),
+               }
+               return;
+            }
+            CmdId::Zadd if raw.len() == 4 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let Some(score_str) = part_str(out, raw[2]) else {
+                  return;
+               };
+               let Some(member) = part_str(out, raw[3]) else {
+                  return;
+               };
+               if let Ok(score) = score_str.parse::<f64>() {
+                  match self.store.zadd(key, &[(score, member)], Default::default()) {
+                     Ok(n) => {
+                        if self.store.has_replication() {
+                           self.store.record_current_value(key);
+                        }
+                        crate::utils::resp::write_integer(out, n as i64)
+                     }
+                     Err(_) => crate::utils::resp::write_wrong_type(out),
+                  }
+               } else {
+                  out.extend_from_slice(b"-ERR value is not a valid float\r\n");
+               }
+               return;
+            }
+            CmdId::Xadd if raw.len() == 5 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let Some(id_str) = part_str(out, raw[2]) else {
+                  return;
+               };
+               let Some(f) = part_str(out, raw[3]) else {
+                  return;
+               };
+               let Some(v) = part_str(out, raw[4]) else {
+                  return;
+               };
+               match self.store.xadd_id(key, id_str, &[(f, v)], None, false) {
+                  Ok(Some(id)) => id.write_to_resp(out),
+                  Ok(None) => crate::utils::resp::write_nil(out),
+                  Err(e) => crate::utils::resp::write_store_err(out, e),
+               }
+               if self.store.has_replication() {
+                  self.store.record_current_value(key);
+               }
+               return;
+            }
+            CmdId::Lpush if raw.len() == 3 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let Some(value) = part_str(out, raw[2]) else {
+                  return;
+               };
+               match self.store.lpush(key, &[value]) {
+                  Ok(n) => {
+                     if self.store.has_replication() {
+                        self.store.record_current_value(key);
+                     }
+                     crate::utils::resp::write_integer(out, n as i64)
+                  }
+                  Err(_) => crate::utils::resp::write_wrong_type(out),
+               }
+               return;
+            }
+            CmdId::Rpush if raw.len() == 3 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let Some(value) = part_str(out, raw[2]) else {
+                  return;
+               };
+               match self.store.rpush(key, &[value]) {
+                  Ok(n) => {
+                     if self.store.has_replication() {
+                        self.store.record_current_value(key);
+                     }
+                     crate::utils::resp::write_integer(out, n as i64)
+                  }
+                  Err(_) => crate::utils::resp::write_wrong_type(out),
+               }
+               return;
+            }
+            CmdId::Pfadd if raw.len() == 3 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let Some(elem) = part_str(out, raw[2]) else {
+                  return;
+               };
+               match self.store.pfadd(key, &[elem]) {
+                  Ok(changed) => {
+                     if self.store.has_replication() {
+                        self.store.record_current_value(key);
+                     }
+                     write_boolean(out, changed);
+                  }
+                  Err(e) => crate::utils::resp::write_store_err(out, e),
+               }
+               return;
+            }
+            CmdId::Expire if raw.len() == 3 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let Some(secs) = part_str(out, raw[2]) else {
+                  return;
+               };
+               let reply = match secs
+                 .parse::<u64>()
+                 .ok()
+                 .and_then(crate::storage::value::expiry_from_secs)
+               {
+                  Some(exp) => {
+                     let ok = self.store.expire_ms(key, exp);
+                     if self.store.has_replication() {
+                        self.store.record_current_value(key);
+                     }
+                     crate::utils::resp::INT_CACHE[ok as usize]
+                  }
+                  None => b"-ERR invalid expire time in 'expire' command\r\n" as &[u8],
+               };
+               out.extend_from_slice(reply);
+               return;
+            }
+            CmdId::Setbit if raw.len() == 4 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let Some(offset_str) = part_str(out, raw[2]) else {
+                  return;
+               };
+               let Some(value_str) = part_str(out, raw[3]) else {
+                  return;
+               };
+               if let (Ok(off), Ok(val)) = (offset_str.parse::<u64>(), value_str.parse::<u8>()) {
+                  if val <= 1 {
+                     match self.store.setbit(key, off, val == 1) {
+                        Ok(prev) => {
+                           if self.store.has_replication() {
+                              self.store.record_current_value(key);
+                           }
+                           crate::utils::resp::write_integer(out, prev as i64);
+                        }
+                        Err(e) => crate::utils::resp::write_store_err(out, e),
+                     }
+                  } else {
+                     out.extend_from_slice(b"-ERR bit is not an integer or out of range\r\n");
+                  }
+               } else {
+                  out.extend_from_slice(b"-ERR value is not an integer or out of range\r\n");
+               }
+               return;
+            }
+            CmdId::Geoadd if raw.len() == 5 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let Some(lon_str) = part_str(out, raw[2]) else {
+                  return;
+               };
+               let Some(lat_str) = part_str(out, raw[3]) else {
+                  return;
+               };
+               let Some(member) = part_str(out, raw[4]) else {
+                  return;
+               };
+               if let (Ok(lon), Ok(lat)) = (lon_str.parse::<f64>(), lat_str.parse::<f64>()) {
+                  if (-180.0..=180.0).contains(&lon) && (-85.05112878..=85.05112878).contains(&lat) {
+                     match self
+                       .store
+                       .geoadd(key, &[(lon, lat, member)], false, false, false)
+                     {
+                        Ok(n) => {
+                           if self.store.has_replication() {
+                              self.store.record_current_value(key);
+                           }
+                           crate::utils::resp::write_integer(out, n as i64);
+                        }
+                        Err(e) => crate::utils::resp::write_store_err(out, e),
+                     }
+                  } else {
+                     out.extend_from_slice(b"-ERR invalid longitude,latitude pair\r\n");
+                  }
+               } else {
+                  out.extend_from_slice(b"-ERR value is not a valid float\r\n");
+               }
+               return;
+            }
+            CmdId::Pfcount if raw.len() == 2 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               match self.store.pfcount(&[key]) {
+                  Ok(n) => crate::utils::resp::write_integer(out, n as i64),
+                  Err(e) => crate::utils::resp::write_store_err(out, e),
+               }
+               return;
+            }
+            CmdId::Geodist if raw.len() == 4 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let Some(m1) = part_str(out, raw[2]) else {
+                  return;
+               };
+               let Some(m2) = part_str(out, raw[3]) else {
+                  return;
+               };
+               match self
+                 .store
+                 .geodist(key, m1, m2, crate::storage::geo::GeoUnit::M)
+               {
+                  Ok(Some(d)) => crate::utils::resp::write_float(out, d),
+                  Ok(None) => crate::utils::resp::write_nil(out),
+                  Err(e) => crate::utils::resp::write_store_err(out, e),
+               }
+               return;
+            }
+            CmdId::Publish if raw.len() == 3 => {
+               let out = &mut self.parser.wbuf;
+               let Some(channel) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let Some(message) = part_str(out, raw[2]) else {
+                  return;
+               };
+               let n = self.pubsub.publish(channel, message);
+               crate::utils::resp::write_integer(out, n as i64);
+               return;
+            }
+            CmdId::Bitcount if raw.len() == 2 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               match self.store.bitcount(key, 0, -1, false) {
+                  Ok(c) => crate::utils::resp::write_integer(out, c as i64),
+                  Err(_) => crate::utils::resp::write_wrong_type(out),
+               }
+               return;
+            }
+            CmdId::JsonSet if raw.len() == 4 => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let Some(path) = part_str(out, raw[2]) else {
+                  return;
+               };
+               let Some(value) = part_str(out, raw[3]) else {
+                  return;
+               };
+               match self.store.json_set(key, path, value, false, false) {
+                  Ok(true) => {
+                     if self.store.has_replication() {
+                        self.store.record_current_value(key);
+                     }
+                     crate::utils::resp::write_ok(out);
+                  }
+                  Ok(false) => crate::utils::resp::write_nil(out),
+                  Err(e) => crate::utils::resp::write_store_err(out, e),
+               }
+               return;
+            }
+            CmdId::JsonGet => {
+               let out = &mut self.parser.wbuf;
+               let Some(key) = part_str(out, raw[1]) else {
+                  return;
+               };
+               let res = if raw.len() == 2 {
+                  self.store.json_get_to_buf(key, &[], out)
+               } else if raw.len() == 3 {
+                  let Some(path) = part_str(out, raw[2]) else {
+                     return;
+                  };
+                  self.store.json_get_to_buf(key, &[path], out)
+               } else {
+                  crate::utils::resp::write_wrong_args(out, "json.get");
+                  return;
+               };
+               match res {
+                  Ok(true) => {}
+                  Ok(false) => crate::utils::resp::write_nil(out),
+                  Err(e) => crate::utils::resp::write_store_err(out, e),
+               }
+               return;
+            }
+            _ => {}
+         }
+      }
+
+      // Only pay for the write gate when cluster is actually enabled and the
+      // command is a write.
+      let cluster_is_write = self.store.cluster.enabled && crate::cluster::is_write_command(cmd);
+
+      if self.store.at_key_capacity() && crate::storage::capacity::is_denyoom_command(cmd) {
+         self
+           .parser
+           .wbuf
+           .extend_from_slice(crate::storage::capacity::OOM_REPLY);
+         return;
+      }
+
+      let store = self.store;
+      let _cluster_write_guard = if cluster_is_write {
+         Some(store.begin_write(self.worker))
       } else {
-         out.extend_from_slice(b"+OK\r\n");
+         None
+      };
+
+      if self.store.cluster.enabled {
+         if self.store.replica_installing() {
+            self
+              .parser
+              .wbuf
+              .extend_from_slice(b"-CLUSTERDOWN Replica snapshot is installing\r\n");
+            return;
+         }
+         if self.store.cluster.is_replica && cluster_is_write {
+            self
+              .parser
+              .wbuf
+              .extend_from_slice(b"-READONLY You can't write against a read only replica.\r\n");
+            return;
+         }
+
+         self.refresh_topology();
+         let asking = std::mem::take(&mut self.asking);
+
+         // The argument slice is materialized only for multi-key commands;
+         // keyless and single-key commands skip it.
+         let decision = match crate::cluster::routing_scope(cmd) {
+            crate::cluster::RoutingScope::Keyless => crate::cluster::RouteDecision::Local,
+            crate::cluster::RoutingScope::FirstKey => match raw.get(1) {
+               Some(&part) => {
+                  let (topology, routing) = self.cached_topology();
+                  crate::cluster::route_single_key(
+                     &self.store.cluster,
+                     self.store.cluster_state_ref(),
+                     topology,
+                     routing,
+                     unsafe { part_bytes(part) },
+                     asking,
+                  )
+               }
+               None => crate::cluster::RouteDecision::Local,
+            },
+            crate::cluster::RoutingScope::ManyKeys => {
+               const STACK_ARGS: usize = 32;
+               if raw.len() > STACK_ARGS - 1 {
+                  let args: Vec<&[u8]> = raw[1..]
+                    .iter()
+                    .map(|&part| unsafe { part_bytes(part) })
+                    .collect();
+                  self.route_cached(cmd, &args, asking)
+               } else {
+                  let mut stack_args = [&[][..]; STACK_ARGS];
+                  for (index, part) in raw[1..].iter().enumerate() {
+                     stack_args[index] = unsafe { part_bytes(*part) };
+                  }
+                  self.route_cached(cmd, &stack_args[..raw.len() - 1], asking)
+               }
+            }
+         };
+         match decision {
+            crate::cluster::RouteDecision::Local => {}
+            other => {
+               let topology = self
+                 .topology_cache
+                 .as_ref()
+                 .map(|(_, topology, _)| topology.as_ref());
+               write_route_decision(&mut self.parser.wbuf, other, topology);
+               return;
+            }
+         }
       }
-      return;
-   }
 
-   if !conn.authenticated {
-      handle_unauth(conn, raw, cmd);
-      return;
-   }
+      if park::is_blocking_cmd(cmd) {
+         self.dispatch_blocking(raw);
+         return;
+      }
+      if park::is_blocking_stream_read(cmd, raw) {
+         self.dispatch_stream_read(raw);
+         return;
+      }
 
-   if id == CmdId::Auth {
-      handle_auth(conn, raw);
-      return;
-   } else if id == CmdId::Hello {
-      handle_hello(conn, raw);
-      return;
-   }
-
-   if !conn.store.cluster.enabled && !conn.store.at_key_capacity() {
       match id {
-         CmdId::Get if raw.len() == 2 => {
-            dispatch_get_run(conn, raw[1]);
-            return;
-         }
-         CmdId::Set if raw.len() == 3 => {
-            dispatch_set_run(conn, raw[1], raw[2]);
-            return;
-         }
-         CmdId::Del if raw.len() == 2 => {
-            let out = &mut conn.parser.wbuf;
+         CmdId::Set if raw.len() >= 3 => {
+            let (hint, entry) = self.hint_for(raw[1]);
+            let out = &mut self.parser.wbuf;
             let Some(key) = part_str(out, raw[1]) else {
                return;
             };
-            crate::utils::resp::write_boolean(out, conn.store.del(key));
+            let Some(value) = part_str(out, raw[2]) else {
+               return;
+            };
+            if raw.len() == 3 {
+               self.store.set_string_auto(key, hint, entry, value, 0);
+               if self.store.has_replication() {
+                  self.store.record_current_value(key);
+               }
+               self.parser.wbuf.extend_from_slice(b"+OK\r\n");
+               return;
+            }
+         }
+         CmdId::Get if raw.len() == 2 => {
+            let (hint, entry) = self.hint_for(raw[1]);
+            let out = &mut self.parser.wbuf;
+            let Some(key) = part_str(out, raw[1]) else {
+               return;
+            };
+            if !self.store.get_to_buf_auto(key, hint, entry, out) {
+               out.extend_from_slice(b"$-1\r\n");
+            }
+            return;
+         }
+         CmdId::Del if raw.len() == 2 => {
+            let Some(key) = part_str(&mut self.parser.wbuf, raw[1]) else {
+               return;
+            };
+            write_boolean(&mut self.parser.wbuf, self.store.del(key));
             return;
          }
          CmdId::Hget if raw.len() == 3 => {
-            let out = &mut conn.parser.wbuf;
+            let out = &mut self.parser.wbuf;
             let Some(key) = part_str(out, raw[1]) else {
                return;
             };
             let Some(field) = part_str(out, raw[2]) else {
                return;
             };
-            match conn.store.hget_to_buf(key, field, out) {
+            match self.store.hget_to_buf(key, field, out) {
                Ok(true) => {}
                Ok(false) => crate::utils::resp::write_nil(out),
                Err(_) => crate::utils::resp::write_wrong_type(out),
             }
             return;
          }
-         CmdId::Hset if raw.len() == 4 => {
-            let out = &mut conn.parser.wbuf;
+         CmdId::Hset if raw.len() >= 4 && (raw.len() - 2).is_multiple_of(2) => {
+            let out = &mut self.parser.wbuf;
             let Some(key) = part_str(out, raw[1]) else {
                return;
             };
-            let pair = [(unsafe { part_bytes(raw[2]) }, unsafe { part_bytes(raw[3]) })];
-            crate::commands::hash::hset_raw(key, &pair, conn.store, out);
-            if conn.store.has_replication() {
-               conn.store.record_current_value(key);
+            if raw.len() == 4 {
+               let pair = [(unsafe { part_bytes(raw[2]) }, unsafe { part_bytes(raw[3]) })];
+               crate::commands::hash::hset_raw(key, &pair, self.store, &mut self.parser.wbuf);
+            } else {
+               let n_pairs = (raw.len() - 2) / 2;
+               const STACK_PAIRS: usize = 16;
+               if n_pairs <= STACK_PAIRS {
+                  let mut stack_pairs = [(&[][..], &[][..]); STACK_PAIRS];
+                  for i in 0..n_pairs {
+                     stack_pairs[i] = (unsafe { part_bytes(raw[2 + i * 2]) }, unsafe {
+                        part_bytes(raw[3 + i * 2])
+                     });
+                  }
+                  crate::commands::hash::hset_raw(
+                     key,
+                     &stack_pairs[..n_pairs],
+                     self.store,
+                     &mut self.parser.wbuf,
+                  );
+               } else {
+                  let mut pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(n_pairs);
+                  for i in 0..n_pairs {
+                     pairs.push((unsafe { part_bytes(raw[2 + i * 2]) }, unsafe {
+                        part_bytes(raw[3 + i * 2])
+                     }));
+                  }
+                  crate::commands::hash::hset_raw(key, &pairs, self.store, &mut self.parser.wbuf);
+               }
+            }
+            if self.store.has_replication() {
+               self.store.record_current_value(key);
             }
             return;
          }
          CmdId::Ping => {
             if raw.len() == 1 {
-               conn.parser.wbuf.extend_from_slice(crate::utils::resp::PONG);
+               self.parser.wbuf.extend_from_slice(crate::utils::resp::PONG);
                return;
             } else if raw.len() == 2 {
                let msg = unsafe { part_bytes(raw[1]) };
-               crate::utils::resp::write_bulk_bytes(&mut conn.parser.wbuf, msg);
+               crate::utils::resp::write_bulk_bytes(&mut self.parser.wbuf, msg);
                return;
             }
          }
          CmdId::Incr if raw.len() == 2 => {
-            let (hint, _) = conn.hint_for(raw[1]);
-            let out = &mut conn.parser.wbuf;
+            let out = &mut self.parser.wbuf;
             let Some(key) = part_str(out, raw[1]) else {
                return;
             };
-            match conn.store.incr_hinted(key, hint) {
+            match self.store.incr(key) {
                Ok(n) => {
-                  if conn.store.has_replication() {
-                     conn.store.record_current_value(key);
+                  if self.store.has_replication() {
+                     self.store.record_current_value(key);
                   }
-                  crate::utils::resp::write_integer(out, n)
+                  crate::utils::resp::write_integer(&mut self.parser.wbuf, n)
                }
-               Err(e) => crate::utils::resp::write_err(out, e),
+               Err(e) => crate::utils::resp::write_err(&mut self.parser.wbuf, e),
             }
             return;
          }
          CmdId::Rpop if raw.len() == 2 => {
-            let out = &mut conn.parser.wbuf;
+            let out = &mut self.parser.wbuf;
             let Some(key) = part_str(out, raw[1]) else {
                return;
             };
-            match conn.store.pop_one_to_buf(key, true, out) {
+            match self.store.pop_one_to_buf(key, true, &mut self.parser.wbuf) {
                Ok(true) => {
-                  if conn.store.has_replication() {
-                     conn.store.record_current_value(key);
+                  if self.store.has_replication() {
+                     self.store.record_current_value(key);
                   }
                }
-               Ok(false) => out.extend_from_slice(b"$-1\r\n"),
-               Err(_) => crate::utils::resp::write_wrong_type(out),
+               Ok(false) => self.parser.wbuf.extend_from_slice(b"$-1\r\n"),
+               Err(_) => crate::utils::resp::write_wrong_type(&mut self.parser.wbuf),
             }
             return;
          }
          CmdId::Lpop if raw.len() == 2 => {
-            let out = &mut conn.parser.wbuf;
+            let out = &mut self.parser.wbuf;
             let Some(key) = part_str(out, raw[1]) else {
                return;
             };
-            match conn.store.pop_one_to_buf(key, false, out) {
+            match self.store.pop_one_to_buf(key, false, &mut self.parser.wbuf) {
                Ok(true) => {
-                  if conn.store.has_replication() {
-                     conn.store.record_current_value(key);
+                  if self.store.has_replication() {
+                     self.store.record_current_value(key);
                   }
                }
-               Ok(false) => out.extend_from_slice(b"$-1\r\n"),
-               Err(_) => crate::utils::resp::write_wrong_type(out),
+               Ok(false) => self.parser.wbuf.extend_from_slice(b"$-1\r\n"),
+               Err(_) => crate::utils::resp::write_wrong_type(&mut self.parser.wbuf),
             }
             return;
          }
-         CmdId::Sadd if raw.len() == 3 => {
-            let out = &mut conn.parser.wbuf;
+         CmdId::Sadd if raw.len() >= 3 => {
+            let out = &mut self.parser.wbuf;
             let Some(key) = part_str(out, raw[1]) else {
                return;
             };
-            let Some(member) = part_str(out, raw[2]) else {
-               return;
-            };
-            match conn.store.sadd(key, &[member]) {
-               Ok(n) => {
-                  if conn.store.has_replication() {
-                     conn.store.record_current_value(key);
-                  }
-                  crate::utils::resp::write_integer(out, n as i64)
-               }
-               Err(_) => crate::utils::resp::write_wrong_type(out),
-            }
-            return;
-         }
-         CmdId::Zadd if raw.len() == 4 => {
-            let out = &mut conn.parser.wbuf;
-            let Some(key) = part_str(out, raw[1]) else {
-               return;
-            };
-            let Some(score_str) = part_str(out, raw[2]) else {
-               return;
-            };
-            let Some(member) = part_str(out, raw[3]) else {
-               return;
-            };
-            if let Ok(score) = score_str.parse::<f64>() {
-               match conn.store.zadd(key, &[(score, member)], Default::default()) {
+            if raw.len() == 3 {
+               let Some(member) = part_str(out, raw[2]) else {
+                  return;
+               };
+               match self.store.sadd(key, &[member]) {
                   Ok(n) => {
-                     if conn.store.has_replication() {
-                        conn.store.record_current_value(key);
+                     if self.store.has_replication() {
+                        self.store.record_current_value(key);
                      }
-                     crate::utils::resp::write_integer(out, n as i64)
+                     crate::utils::resp::write_integer(&mut self.parser.wbuf, n as i64)
                   }
-                  Err(_) => crate::utils::resp::write_wrong_type(out),
+                  Err(_) => crate::utils::resp::write_wrong_type(&mut self.parser.wbuf),
                }
-            } else {
-               out.extend_from_slice(b"-ERR value is not a valid float\r\n");
+               return;
             }
-            return;
-         }
-         CmdId::Xadd if raw.len() == 5 => {
-            let out = &mut conn.parser.wbuf;
-            let Some(key) = part_str(out, raw[1]) else {
-               return;
-            };
-            let Some(id_str) = part_str(out, raw[2]) else {
-               return;
-            };
-            let Some(f) = part_str(out, raw[3]) else {
-               return;
-            };
-            let Some(v) = part_str(out, raw[4]) else {
-               return;
-            };
-            match conn.store.xadd_id(key, id_str, &[(f, v)], None, false) {
-               Ok(Some(id)) => id.write_to_resp(out),
-               Ok(None) => crate::utils::resp::write_nil(out),
-               Err(e) => crate::utils::resp::write_store_err(out, e),
-            }
-            if conn.store.has_replication() {
-               conn.store.record_current_value(key);
-            }
-            return;
-         }
-         CmdId::Lpush if raw.len() == 3 => {
-            let out = &mut conn.parser.wbuf;
-            let Some(key) = part_str(out, raw[1]) else {
-               return;
-            };
-            let Some(value) = part_str(out, raw[2]) else {
-               return;
-            };
-            match conn.store.lpush(key, &[value]) {
-               Ok(n) => {
-                  if conn.store.has_replication() {
-                     conn.store.record_current_value(key);
-                  }
-                  crate::utils::resp::write_integer(out, n as i64)
-               }
-               Err(_) => crate::utils::resp::write_wrong_type(out),
-            }
-            return;
-         }
-         CmdId::Rpush if raw.len() == 3 => {
-            let out = &mut conn.parser.wbuf;
-            let Some(key) = part_str(out, raw[1]) else {
-               return;
-            };
-            let Some(value) = part_str(out, raw[2]) else {
-               return;
-            };
-            match conn.store.rpush(key, &[value]) {
-               Ok(n) => {
-                  if conn.store.has_replication() {
-                     conn.store.record_current_value(key);
-                  }
-                  crate::utils::resp::write_integer(out, n as i64)
-               }
-               Err(_) => crate::utils::resp::write_wrong_type(out),
-            }
-            return;
-         }
-         CmdId::Pfadd if raw.len() == 3 => {
-            let out = &mut conn.parser.wbuf;
-            let Some(key) = part_str(out, raw[1]) else {
-               return;
-            };
-            let Some(elem) = part_str(out, raw[2]) else {
-               return;
-            };
-            match conn.store.pfadd(key, &[elem]) {
-               Ok(changed) => {
-                  if conn.store.has_replication() {
-                     conn.store.record_current_value(key);
-                  }
-                  crate::utils::resp::write_boolean(out, changed);
-               }
-               Err(e) => crate::utils::resp::write_store_err(out, e),
-            }
-            return;
          }
          CmdId::Expire if raw.len() == 3 => {
-            let out = &mut conn.parser.wbuf;
+            let out = &mut self.parser.wbuf;
             let Some(key) = part_str(out, raw[1]) else {
                return;
             };
@@ -1021,574 +1462,230 @@ pub(super) fn dispatch_raw(conn: &mut Conn<'_>, raw: &[(*const u8, usize)]) {
                return;
             };
             let reply = match secs
-               .parse::<u64>()
-               .ok()
-               .and_then(crate::storage::value::expiry_from_secs)
+              .parse::<u64>()
+              .ok()
+              .and_then(crate::storage::value::expiry_from_secs)
             {
                Some(exp) => {
-                  let ok = conn.store.expire_ms(key, exp);
-                  if conn.store.has_replication() {
-                     conn.store.record_current_value(key);
+                  let ok = self.store.expire_ms(key, exp);
+                  if self.store.has_replication() {
+                     self.store.record_current_value(key);
                   }
-                  if ok {
-                     crate::utils::resp::ONE
-                  } else {
-                     crate::utils::resp::ZERO
-                  }
+                  crate::utils::resp::INT_CACHE[ok as usize]
                }
                None => b"-ERR invalid expire time in 'expire' command\r\n" as &[u8],
             };
-            out.extend_from_slice(reply);
+            self.parser.wbuf.extend_from_slice(reply);
             return;
          }
-         CmdId::Setbit if raw.len() == 4 => {
-            let out = &mut conn.parser.wbuf;
+         CmdId::Lpush if raw.len() == 3 => {
+            let out = &mut self.parser.wbuf;
             let Some(key) = part_str(out, raw[1]) else {
                return;
             };
-            let Some(offset_str) = part_str(out, raw[2]) else {
+            let Some(value) = part_str(out, raw[2]) else {
                return;
             };
-            let Some(value_str) = part_str(out, raw[3]) else {
-               return;
-            };
-            if let (Ok(off), Ok(val)) = (offset_str.parse::<u64>(), value_str.parse::<u8>()) {
-               if val <= 1 {
-                  match conn.store.setbit(key, off, val == 1) {
-                     Ok(prev) => {
-                        if conn.store.has_replication() {
-                           conn.store.record_current_value(key);
-                        }
-                        crate::utils::resp::write_integer(out, prev as i64);
-                     }
-                     Err(e) => crate::utils::resp::write_store_err(out, e),
+            match self.store.lpush(key, &[value]) {
+               Ok(n) => {
+                  if self.store.has_replication() {
+                     self.store.record_current_value(key);
                   }
-               } else {
-                  out.extend_from_slice(b"-ERR bit is not an integer or out of range\r\n");
+                  crate::utils::resp::write_integer(&mut self.parser.wbuf, n as i64)
                }
-            } else {
-               out.extend_from_slice(b"-ERR value is not an integer or out of range\r\n");
-            }
-            return;
-         }
-         CmdId::Geoadd if raw.len() == 5 => {
-            let out = &mut conn.parser.wbuf;
-            let Some(key) = part_str(out, raw[1]) else {
-               return;
-            };
-            let Some(lon_str) = part_str(out, raw[2]) else {
-               return;
-            };
-            let Some(lat_str) = part_str(out, raw[3]) else {
-               return;
-            };
-            let Some(member) = part_str(out, raw[4]) else {
-               return;
-            };
-            if let (Ok(lon), Ok(lat)) = (lon_str.parse::<f64>(), lat_str.parse::<f64>()) {
-               if (-180.0..=180.0).contains(&lon) && (-85.05112878..=85.05112878).contains(&lat) {
-                  match conn
-                     .store
-                     .geoadd(key, &[(lon, lat, member)], false, false, false)
-                  {
-                     Ok(n) => {
-                        if conn.store.has_replication() {
-                           conn.store.record_current_value(key);
-                        }
-                        crate::utils::resp::write_integer(out, n as i64);
-                     }
-                     Err(e) => crate::utils::resp::write_store_err(out, e),
-                  }
-               } else {
-                  out.extend_from_slice(b"-ERR invalid longitude,latitude pair\r\n");
-               }
-            } else {
-               out.extend_from_slice(b"-ERR value is not a valid float\r\n");
-            }
-            return;
-         }
-         CmdId::Pfcount if raw.len() == 2 => {
-            let out = &mut conn.parser.wbuf;
-            let Some(key) = part_str(out, raw[1]) else {
-               return;
-            };
-            match conn.store.pfcount(&[key]) {
-               Ok(n) => crate::utils::resp::write_integer(out, n as i64),
-               Err(e) => crate::utils::resp::write_store_err(out, e),
-            }
-            return;
-         }
-         CmdId::Geodist if raw.len() == 4 => {
-            let out = &mut conn.parser.wbuf;
-            let Some(key) = part_str(out, raw[1]) else {
-               return;
-            };
-            let Some(m1) = part_str(out, raw[2]) else {
-               return;
-            };
-            let Some(m2) = part_str(out, raw[3]) else {
-               return;
-            };
-            match conn
-               .store
-               .geodist(key, m1, m2, crate::storage::geo::GeoUnit::M)
-            {
-               Ok(Some(d)) => crate::utils::resp::write_float(out, d),
-               Ok(None) => crate::utils::resp::write_nil(out),
-               Err(e) => crate::utils::resp::write_store_err(out, e),
-            }
-            return;
-         }
-         CmdId::Publish if raw.len() == 3 => {
-            let out = &mut conn.parser.wbuf;
-            let Some(channel) = part_str(out, raw[1]) else {
-               return;
-            };
-            let Some(message) = part_str(out, raw[2]) else {
-               return;
-            };
-            let n = conn.pubsub.publish(channel, message);
-            crate::utils::resp::write_integer(out, n as i64);
-            return;
-         }
-         CmdId::Bitcount if raw.len() == 2 => {
-            let out = &mut conn.parser.wbuf;
-            let Some(key) = part_str(out, raw[1]) else {
-               return;
-            };
-            match conn.store.bitcount(key, 0, -1, false) {
-               Ok(c) => crate::utils::resp::write_integer(out, c as i64),
-               Err(_) => crate::utils::resp::write_wrong_type(out),
-            }
-            return;
-         }
-         CmdId::JsonSet if raw.len() == 4 => {
-            let out = &mut conn.parser.wbuf;
-            let Some(key) = part_str(out, raw[1]) else {
-               return;
-            };
-            let Some(path) = part_str(out, raw[2]) else {
-               return;
-            };
-            let Some(value) = part_str(out, raw[3]) else {
-               return;
-            };
-            match conn.store.json_set(key, path, value, false, false) {
-               Ok(true) => {
-                  if conn.store.has_replication() {
-                     conn.store.record_current_value(key);
-                  }
-                  crate::utils::resp::write_ok(out);
-               }
-               Ok(false) => crate::utils::resp::write_nil(out),
-               Err(e) => crate::utils::resp::write_store_err(out, e),
-            }
-            return;
-         }
-         CmdId::JsonGet => {
-            let out = &mut conn.parser.wbuf;
-            let Some(key) = part_str(out, raw[1]) else {
-               return;
-            };
-            let res = if raw.len() == 2 {
-               conn.store.json_get_to_buf(key, &[], out)
-            } else if raw.len() == 3 {
-               let Some(path) = part_str(out, raw[2]) else {
-                  return;
-               };
-               conn.store.json_get_to_buf(key, &[path], out)
-            } else {
-               crate::utils::resp::write_wrong_args(out, "json.get");
-               return;
-            };
-            match res {
-               Ok(true) => {}
-               Ok(false) => crate::utils::resp::write_nil(out),
-               Err(e) => crate::utils::resp::write_store_err(out, e),
+               Err(_) => crate::utils::resp::write_wrong_type(&mut self.parser.wbuf),
             }
             return;
          }
          _ => {}
       }
-   }
-
-   // Only pay for the write gate when cluster is actually enabled and the
-   // command is a write.
-   let cluster_is_write = conn.store.cluster.enabled && crate::cluster::is_write_command(cmd);
-
-   if conn.store.at_key_capacity() && crate::storage::capacity::is_denyoom_command(cmd) {
-      conn
-         .parser
-         .wbuf
-         .extend_from_slice(crate::storage::capacity::OOM_REPLY);
-      return;
-   }
-
-   let store = conn.store;
-   let _cluster_write_guard = if cluster_is_write {
-      Some(store.begin_write(conn.worker))
-   } else {
-      None
-   };
-
-   if conn.store.cluster.enabled {
-      if conn.store.replica_installing() {
-         conn
-            .parser
-            .wbuf
-            .extend_from_slice(b"-CLUSTERDOWN Replica snapshot is installing\r\n");
-         return;
+      if cmd_len == 9
+        && (cmd.eq_ignore_ascii_case(b"FT.SEARCH") || cmd.eq_ignore_ascii_case(b"FT.HYBRID"))
+        && raw.len() >= 3
+      {
+         return ft_search_raw(self, raw);
       }
-      if conn.store.cluster.is_replica && cluster_is_write {
-         conn
-            .parser
-            .wbuf
-            .extend_from_slice(b"-READONLY You can't write against a read only replica.\r\n");
-         return;
+      if is_offloaded_ft(cmd) {
+         return self.ft_offload_generic(raw);
       }
 
-      conn.refresh_topology();
-      let asking = std::mem::take(&mut conn.asking);
-
-      // The argument slice is materialized only for multi-key commands;
-      // keyless and single-key commands skip it.
-      let decision = match crate::cluster::routing_scope(cmd) {
-         crate::cluster::RoutingScope::Keyless => crate::cluster::RouteDecision::Local,
-         crate::cluster::RoutingScope::FirstKey => match raw.get(1) {
-            Some(&part) => {
-               let (topology, routing) = conn.cached_topology();
-               crate::cluster::route_single_key(
-                  &conn.store.cluster,
-                  conn.store.cluster_state_ref(),
-                  topology,
-                  routing,
-                  unsafe { part_bytes(part) },
-                  asking,
-               )
-            }
-            None => crate::cluster::RouteDecision::Local,
-         },
-         crate::cluster::RoutingScope::ManyKeys => {
-            const STACK_ARGS: usize = 32;
-            let mut stack_args = [&[][..]; STACK_ARGS];
-            if raw.len().saturating_sub(1) > STACK_ARGS {
-               let args: Vec<&[u8]> = raw[1..]
-                  .iter()
-                  .map(|&part| unsafe { part_bytes(part) })
-                  .collect();
-               route_cached(conn, cmd, &args, asking)
-            } else {
-               for (index, part) in raw[1..].iter().enumerate() {
-                  stack_args[index] = unsafe { part_bytes(*part) };
-               }
-               let args = &stack_args[..raw.len() - 1];
-               route_cached(conn, cmd, args, asking)
-            }
-         }
-      };
-      match decision {
-         crate::cluster::RouteDecision::Local => {}
-         other => {
-            let topology = conn
-               .topology_cache
-               .as_ref()
-               .map(|(_, topology, _)| topology.as_ref());
-            write_route_decision(&mut conn.parser.wbuf, other, topology);
-            return;
-         }
-      }
-   }
-
-   if park::is_blocking_cmd(cmd) {
-      park::dispatch_blocking(conn, raw);
-      return;
-   }
-   if park::is_blocking_stream_read(cmd, raw) {
-      park::dispatch_stream_read(conn, raw);
-      return;
-   }
-
-   match id {
-      CmdId::Set if raw.len() >= 3 => {
-         let (hint, entry) = conn.hint_for(raw[1]);
-         let out = &mut conn.parser.wbuf;
-         let Some(key) = part_str(out, raw[1]) else {
-            return;
-         };
-         let Some(value) = part_str(out, raw[2]) else {
-            return;
-         };
-         if raw.len() == 3 {
-            conn.store.set_string_auto(key, hint, entry, value, 0);
-            if conn.store.has_replication() {
-               conn.store.record_current_value(key);
-            }
-            conn.parser.wbuf.extend_from_slice(b"+OK\r\n");
-            return;
-         }
-      }
-      CmdId::Get if raw.len() == 2 => {
-         let (hint, entry) = conn.hint_for(raw[1]);
-         let out = &mut conn.parser.wbuf;
-         let Some(key) = part_str(out, raw[1]) else {
-            return;
-         };
-         if !conn.store.get_to_buf_auto(key, hint, entry, out) {
-            out.extend_from_slice(b"$-1\r\n");
-         }
-         return;
-      }
-      CmdId::Del if raw.len() == 2 => {
-         let out = &mut conn.parser.wbuf;
-         let Some(key) = part_str(out, raw[1]) else {
-            return;
-         };
-         if conn.store.del(key) {
-            conn.parser.wbuf.extend_from_slice(b":1\r\n");
-         } else {
-            conn.parser.wbuf.extend_from_slice(b":0\r\n");
-         }
-         return;
-      }
-      CmdId::Hget if raw.len() == 3 => {
-         let out = &mut conn.parser.wbuf;
-         let Some(key) = part_str(out, raw[1]) else {
-            return;
-         };
-         let Some(field) = part_str(out, raw[2]) else {
-            return;
-         };
-         match conn.store.hget_to_buf(key, field, out) {
-            Ok(true) => {}
-            Ok(false) => crate::utils::resp::write_nil(out),
-            Err(_) => crate::utils::resp::write_wrong_type(out),
-         }
-         return;
-      }
-      CmdId::Hset if raw.len() >= 4 && (raw.len() - 2).is_multiple_of(2) => {
-         let out = &mut conn.parser.wbuf;
-         let Some(key) = part_str(out, raw[1]) else {
-            return;
-         };
-         if raw.len() == 4 {
-            let pair = [(unsafe { part_bytes(raw[2]) }, unsafe { part_bytes(raw[3]) })];
-            crate::commands::hash::hset_raw(key, &pair, conn.store, &mut conn.parser.wbuf);
-         } else {
-            let n_pairs = (raw.len() - 2) / 2;
-            const STACK_PAIRS: usize = 16;
-            if n_pairs <= STACK_PAIRS {
-               let mut stack_pairs = [(&[][..], &[][..]); STACK_PAIRS];
-               for i in 0..n_pairs {
-                  stack_pairs[i] = (unsafe { part_bytes(raw[2 + i * 2]) }, unsafe {
-                     part_bytes(raw[3 + i * 2])
-                  });
-               }
-               crate::commands::hash::hset_raw(
-                  key,
-                  &stack_pairs[..n_pairs],
-                  conn.store,
-                  &mut conn.parser.wbuf,
-               );
-            } else {
-               let mut pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(n_pairs);
-               for i in 0..n_pairs {
-                  pairs.push((unsafe { part_bytes(raw[2 + i * 2]) }, unsafe {
-                     part_bytes(raw[3 + i * 2])
-                  }));
-               }
-               crate::commands::hash::hset_raw(key, &pairs, conn.store, &mut conn.parser.wbuf);
-            }
-         }
-         if conn.store.has_replication() {
-            conn.store.record_current_value(key);
-         }
-         return;
-      }
-      CmdId::Ping => {
-         if raw.len() == 1 {
-            conn.parser.wbuf.extend_from_slice(crate::utils::resp::PONG);
-            return;
-         } else if raw.len() == 2 {
-            let msg = unsafe { part_bytes(raw[1]) };
-            crate::utils::resp::write_bulk_bytes(&mut conn.parser.wbuf, msg);
-            return;
-         }
-      }
-      CmdId::Incr if raw.len() == 2 => {
-         let out = &mut conn.parser.wbuf;
-         let Some(key) = part_str(out, raw[1]) else {
-            return;
-         };
-         match conn.store.incr(key) {
-            Ok(n) => {
-               if conn.store.has_replication() {
-                  conn.store.record_current_value(key);
-               }
-               crate::utils::resp::write_integer(&mut conn.parser.wbuf, n)
-            }
-            Err(e) => crate::utils::resp::write_err(&mut conn.parser.wbuf, e),
-         }
-         return;
-      }
-      CmdId::Rpop if raw.len() == 2 => {
-         let out = &mut conn.parser.wbuf;
-         let Some(key) = part_str(out, raw[1]) else {
-            return;
-         };
-         match conn.store.pop_one_to_buf(key, true, &mut conn.parser.wbuf) {
-            Ok(true) => {
-               if conn.store.has_replication() {
-                  conn.store.record_current_value(key);
-               }
-            }
-            Ok(false) => conn.parser.wbuf.extend_from_slice(b"$-1\r\n"),
-            Err(_) => crate::utils::resp::write_wrong_type(&mut conn.parser.wbuf),
-         }
-         return;
-      }
-      CmdId::Lpop if raw.len() == 2 => {
-         let out = &mut conn.parser.wbuf;
-         let Some(key) = part_str(out, raw[1]) else {
-            return;
-         };
-         match conn.store.pop_one_to_buf(key, false, &mut conn.parser.wbuf) {
-            Ok(true) => {
-               if conn.store.has_replication() {
-                  conn.store.record_current_value(key);
-               }
-            }
-            Ok(false) => conn.parser.wbuf.extend_from_slice(b"$-1\r\n"),
-            Err(_) => crate::utils::resp::write_wrong_type(&mut conn.parser.wbuf),
-         }
-         return;
-      }
-      CmdId::Sadd if raw.len() >= 3 => {
-         let out = &mut conn.parser.wbuf;
-         let Some(key) = part_str(out, raw[1]) else {
-            return;
-         };
-         if raw.len() == 3 {
-            let Some(member) = part_str(out, raw[2]) else {
+      const STACK_CAP: usize = 32;
+      if raw.len() <= STACK_CAP {
+         let mut arr = [""; STACK_CAP];
+         for (i, &part) in raw.iter().enumerate() {
+            let Some(s) = part_str(&mut self.parser.wbuf, part) else {
                return;
             };
-            match conn.store.sadd(key, &[member]) {
-               Ok(n) => {
-                  if conn.store.has_replication() {
-                     conn.store.record_current_value(key);
-                  }
-                  crate::utils::resp::write_integer(&mut conn.parser.wbuf, n as i64)
-               }
-               Err(_) => crate::utils::resp::write_wrong_type(&mut conn.parser.wbuf),
-            }
-            return;
+            arr[i] = s;
          }
+         self.dispatch(&arr[..raw.len()]);
+      } else {
+         let mut parts: Vec<&str> = Vec::with_capacity(raw.len());
+         for &part in raw.iter() {
+            let Some(s) = part_str(&mut self.parser.wbuf, part) else {
+               return;
+            };
+            parts.push(s);
+         }
+         self.dispatch(&parts);
       }
-      CmdId::Expire if raw.len() == 3 => {
-         let out = &mut conn.parser.wbuf;
-         let Some(key) = part_str(out, raw[1]) else {
+   }
+
+   /// Route one command against this connection's cached topology snapshot.
+   #[inline(always)]
+   fn route_cached(
+      &self,
+      cmd: &[u8],
+      args: &[&[u8]],
+      asking: bool,
+   ) -> crate::cluster::RouteDecision<'static> {
+      let (topology, routing) = self.cached_topology();
+      crate::cluster::route_command_with_snapshot(
+         &self.store.cluster,
+         self.store.cluster_state_ref(),
+         topology,
+         routing,
+         cmd,
+         args,
+         asking,
+      )
+   }
+
+   #[inline(never)]
+   fn handle_auth(&mut self, raw: &[(*const u8, usize)]) {
+      if raw.len() == 2 || raw.len() == 3 {
+         let pass_idx = if raw.len() == 3 { 2 } else { 1 };
+         let Some(pass) = part_str(&mut self.parser.wbuf, raw[pass_idx]) else {
             return;
          };
-         let Some(secs) = part_str(out, raw[2]) else {
-            return;
-         };
-         let reply = match secs
-            .parse::<u64>()
-            .ok()
-            .and_then(crate::storage::value::expiry_from_secs)
+         if let Some(expected) = self.auth_required {
+            if constant_time_eq(pass.as_bytes(), expected.as_bytes()) {
+               self.authenticated = true;
+               self.parser.wbuf.extend_from_slice(b"+OK\r\n");
+            } else {
+               self.authenticated = false;
+               self
+                  .parser
+                  .wbuf
+                  .extend_from_slice(b"-WRONGPASS invalid username-password pair\r\n");
+            }
+         } else {
+            self.authenticated = true;
+            self.parser.wbuf.extend_from_slice(b"+OK\r\n");
+         }
+      } else {
+         crate::utils::resp::write_wrong_args(&mut self.parser.wbuf, "auth");
+      }
+   }
+
+   #[inline(never)]
+   fn handle_hello(&mut self, raw: &[(*const u8, usize)]) {
+      let mut proto = 2u32;
+      let mut auth_pass = None;
+      if raw.len() >= 2
+         && let Some(p) = part_str(&mut self.parser.wbuf, raw[1])
+      {
+         proto = p.parse().unwrap_or(2);
+      }
+      let mut i = 2;
+      while i < raw.len() {
+         if let Some(kw) = part_str(&mut self.parser.wbuf, raw[i])
+            && kw.eq_ignore_ascii_case("AUTH")
+            && i + 2 < raw.len()
          {
-            Some(exp) => {
-               let ok = conn.store.expire_ms(key, exp);
-               if conn.store.has_replication() {
-                  conn.store.record_current_value(key);
-               }
-               if ok {
-                  crate::utils::resp::ONE
-               } else {
-                  crate::utils::resp::ZERO
-               }
-            }
-            None => b"-ERR invalid expire time in 'expire' command\r\n" as &[u8],
-         };
-         conn.parser.wbuf.extend_from_slice(reply);
-         return;
-      }
-      CmdId::Lpush if raw.len() == 3 => {
-         let out = &mut conn.parser.wbuf;
-         let Some(key) = part_str(out, raw[1]) else {
-            return;
-         };
-         let Some(value) = part_str(out, raw[2]) else {
-            return;
-         };
-         match conn.store.lpush(key, &[value]) {
-            Ok(n) => {
-               if conn.store.has_replication() {
-                  conn.store.record_current_value(key);
-               }
-               crate::utils::resp::write_integer(&mut conn.parser.wbuf, n as i64)
-            }
-            Err(_) => crate::utils::resp::write_wrong_type(&mut conn.parser.wbuf),
+            auth_pass = part_str(&mut self.parser.wbuf, raw[i + 2]);
+            i += 3;
+            continue;
          }
-         return;
+         i += 1;
       }
-      _ => {}
-   }
-   if cmd_len == 9
-      && (cmd.eq_ignore_ascii_case(b"FT.SEARCH") || cmd.eq_ignore_ascii_case(b"FT.HYBRID"))
-      && raw.len() >= 3
-   {
-      return ft_search_raw(conn, raw);
-   }
-   if is_offloaded_ft(cmd) {
-      return ft_offload_generic(conn, raw);
+
+      if let Some(expected) = self.auth_required
+         && let Some(pass) = auth_pass
+      {
+         if !constant_time_eq(pass.as_bytes(), expected.as_bytes()) {
+            self.authenticated = false;
+            self
+               .parser
+               .wbuf
+               .extend_from_slice(b"-WRONGPASS invalid username-password pair\r\n");
+            return;
+         }
+         self.authenticated = true;
+      }
+
+      if proto == 3 {
+         crate::utils::resp3::write_hello_resp3(&mut self.parser.wbuf);
+      } else {
+         let out = &mut self.parser.wbuf;
+         crate::utils::resp::write_array_header(out, 14);
+         crate::utils::resp::write_bulk(out, "server");
+         crate::utils::resp::write_bulk(out, "fyrodb");
+         crate::utils::resp::write_bulk(out, "version");
+         crate::utils::resp::write_bulk(out, "8.2.0");
+         crate::utils::resp::write_bulk(out, "proto");
+         crate::utils::resp::write_integer(out, 2);
+         crate::utils::resp::write_bulk(out, "id");
+         crate::utils::resp::write_integer(out, 1);
+         crate::utils::resp::write_bulk(out, "mode");
+         crate::utils::resp::write_bulk(out, "standalone");
+         crate::utils::resp::write_bulk(out, "role");
+         crate::utils::resp::write_bulk(out, "master");
+         crate::utils::resp::write_bulk(out, "modules");
+         crate::utils::resp::write_array_header(out, 0);
+      }
    }
 
-   const STACK_CAP: usize = 32;
-   if raw.len() <= STACK_CAP {
-      let mut arr = [""; STACK_CAP];
-      for (i, &part) in raw.iter().enumerate() {
-         let Some(s) = part_str(&mut conn.parser.wbuf, part) else {
-            return;
-         };
-         arr[i] = s;
+   #[cold]
+   #[inline(never)]
+   fn handle_unauth(&mut self, raw: &[(*const u8, usize)], cmd: &[u8]) {
+      let id = cmd_id(cmd);
+      if id == CmdId::Auth {
+         self.handle_auth(raw);
+      } else if id == CmdId::Hello {
+         self.handle_hello(raw);
+      } else if id == CmdId::Ping {
+         self.parser.wbuf.extend_from_slice(b"+PONG\r\n");
+      } else if id == CmdId::Quit {
+         self.parser.wbuf.extend_from_slice(b"+OK\r\n");
+      } else {
+         self.parser.wbuf.extend_from_slice(b"-NOAUTH Authentication required.\r\n");
       }
-      dispatch(conn, &arr[..raw.len()]);
-   } else {
-      let mut parts: Vec<&str> = Vec::with_capacity(raw.len());
-      for &part in raw.iter() {
-         let Some(s) = part_str(&mut conn.parser.wbuf, part) else {
-            return;
-         };
-         parts.push(s);
-      }
-      dispatch(conn, &parts);
    }
-}
 
-/// Route one command against this connection's cached topology snapshot.
-#[inline(always)]
-pub(super) fn route_cached(
-   conn: &Conn<'_>,
-   cmd: &[u8],
-   args: &[&[u8]],
-   asking: bool,
-) -> crate::cluster::RouteDecision<'static> {
-   let (topology, routing) = conn.cached_topology();
-   crate::cluster::route_command_with_snapshot(
-      &conn.store.cluster,
-      conn.store.cluster_state_ref(),
-      topology,
-      routing,
-      cmd,
-      args,
-      asking,
-   )
+   /// FT.AGGREGATE / FT.CURSOR / FT.PROFILE: owned copies of the arguments go
+   /// to the pool with the store handle.
+   fn ft_offload_generic(&mut self, raw: &[(*const u8, usize)]) {
+      let mut parts: Vec<String> = Vec::with_capacity(raw.len());
+      for &p in raw {
+         match std::str::from_utf8(unsafe { part_bytes(p) }) {
+            Ok(s) => parts.push(s.to_string()),
+            Err(_) => {
+               self
+                 .parser
+                 .wbuf
+                 .extend_from_slice(b"-ERR invalid UTF-8 in request\r\n");
+               return;
+            }
+         }
+      }
+      let store = Arc::clone(self.store);
+      let run = move |out: &mut Vec<u8>| {
+         let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+         crate::commands::ft::execute_ft(&refs, &store, out);
+      };
+      if search_offloaded() {
+         self.submit(run);
+      } else {
+         run(&mut self.parser.wbuf);
+      }
+   }
 }
 
 /// Write a non-Local routing decision into the output buffer.
 #[cold]
 #[inline(never)]
-pub(super) fn write_route_decision(
+fn write_route_decision(
    out: &mut Vec<u8>,
    decision: crate::cluster::RouteDecision<'_>,
    topology: Option<&crate::cluster::Topology>,
@@ -1596,7 +1693,7 @@ pub(super) fn write_route_decision(
    #[inline]
    fn write_redirect(out: &mut Vec<u8>, kind: &[u8], slot: crate::cluster::Slot, address: &str) {
       out.extend_from_slice(kind);
-      crate::utils::resp::write_usize(out, slot.value() as usize);
+      write_usize(out, slot.value() as usize);
       out.push(b' ');
       out.extend_from_slice(address.as_bytes());
       out.extend_from_slice(b"\r\n");
@@ -1626,111 +1723,6 @@ pub(super) fn write_route_decision(
 }
 
 #[inline(never)]
-pub(super) fn handle_auth(conn: &mut Conn<'_>, raw: &[(*const u8, usize)]) {
-   if raw.len() == 2 || raw.len() == 3 {
-      let pass_idx = if raw.len() == 3 { 2 } else { 1 };
-      let Some(pass) = part_str(&mut conn.parser.wbuf, raw[pass_idx]) else {
-         return;
-      };
-      if let Some(expected) = conn.auth_required {
-         if constant_time_eq(pass.as_bytes(), expected.as_bytes()) {
-            conn.authenticated = true;
-            conn.parser.wbuf.extend_from_slice(b"+OK\r\n");
-         } else {
-            conn.authenticated = false;
-            conn
-               .parser
-               .wbuf
-               .extend_from_slice(b"-WRONGPASS invalid username-password pair\r\n");
-         }
-      } else {
-         conn.authenticated = true;
-         conn.parser.wbuf.extend_from_slice(b"+OK\r\n");
-      }
-   } else {
-      crate::utils::resp::write_wrong_args(&mut conn.parser.wbuf, "auth");
-   }
-}
-
-#[inline(never)]
-pub(super) fn handle_hello(conn: &mut Conn<'_>, raw: &[(*const u8, usize)]) {
-   let mut proto = 2u32;
-   let mut auth_pass = None;
-   if raw.len() >= 2
-      && let Some(p) = part_str(&mut conn.parser.wbuf, raw[1])
-   {
-      proto = p.parse().unwrap_or(2);
-   }
-   let mut i = 2;
-   while i < raw.len() {
-      if let Some(kw) = part_str(&mut conn.parser.wbuf, raw[i])
-         && kw.eq_ignore_ascii_case("AUTH")
-         && i + 2 < raw.len()
-      {
-         auth_pass = part_str(&mut conn.parser.wbuf, raw[i + 2]);
-         i += 3;
-         continue;
-      }
-      i += 1;
-   }
-
-   if let Some(expected) = conn.auth_required
-      && let Some(pass) = auth_pass
-   {
-      if !constant_time_eq(pass.as_bytes(), expected.as_bytes()) {
-         conn.authenticated = false;
-         conn
-            .parser
-            .wbuf
-            .extend_from_slice(b"-WRONGPASS invalid username-password pair\r\n");
-         return;
-      }
-      conn.authenticated = true;
-   }
-
-   if proto == 3 {
-      crate::utils::resp3::write_hello_resp3(&mut conn.parser.wbuf);
-   } else {
-      let out = &mut conn.parser.wbuf;
-      crate::utils::resp::write_array_header(out, 14);
-      crate::utils::resp::write_bulk(out, "server");
-      crate::utils::resp::write_bulk(out, "fyrodb");
-      crate::utils::resp::write_bulk(out, "version");
-      crate::utils::resp::write_bulk(out, "8.2.0");
-      crate::utils::resp::write_bulk(out, "proto");
-      crate::utils::resp::write_integer(out, 2);
-      crate::utils::resp::write_bulk(out, "id");
-      crate::utils::resp::write_integer(out, 1);
-      crate::utils::resp::write_bulk(out, "mode");
-      crate::utils::resp::write_bulk(out, "standalone");
-      crate::utils::resp::write_bulk(out, "role");
-      crate::utils::resp::write_bulk(out, "master");
-      crate::utils::resp::write_bulk(out, "modules");
-      crate::utils::resp::write_array_header(out, 0);
-   }
-}
-
-#[cold]
-#[inline(never)]
-pub(super) fn handle_unauth(conn: &mut Conn<'_>, raw: &[(*const u8, usize)], cmd: &[u8]) {
-   let id = cmd_id(cmd);
-   if id == CmdId::Auth {
-      handle_auth(conn, raw);
-   } else if id == CmdId::Hello {
-      handle_hello(conn, raw);
-   } else if id == CmdId::Ping {
-      conn.parser.wbuf.extend_from_slice(b"+PONG\r\n");
-   } else if id == CmdId::Quit {
-      conn.parser.wbuf.extend_from_slice(b"+OK\r\n");
-   } else {
-      conn
-         .parser
-         .wbuf
-         .extend_from_slice(b"-NOAUTH Authentication required.\r\n");
-   }
-}
-
-#[inline(never)]
 pub(super) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
    if a.len() != b.len() {
       return false;
@@ -1749,7 +1741,7 @@ fn search_offloaded() -> bool {
    !*INLINE.get_or_init(|| std::env::var("FYRODB_SEARCH_INLINE").is_ok_and(|v| v == "1"))
 }
 
-pub(super) fn is_offloaded_ft(cmd: &[u8]) -> bool {
+fn is_offloaded_ft(cmd: &[u8]) -> bool {
    cmd.len() > 3
       && cmd[..3].eq_ignore_ascii_case(b"FT.")
       && (cmd.eq_ignore_ascii_case(b"FT.AGGREGATE")
@@ -1757,35 +1749,7 @@ pub(super) fn is_offloaded_ft(cmd: &[u8]) -> bool {
          || cmd.eq_ignore_ascii_case(b"FT.PROFILE"))
 }
 
-/// FT.AGGREGATE / FT.CURSOR / FT.PROFILE: owned copies of the arguments go
-/// to the pool with the store handle.
-pub(super) fn ft_offload_generic(conn: &mut Conn<'_>, raw: &[(*const u8, usize)]) {
-   let mut parts: Vec<String> = Vec::with_capacity(raw.len());
-   for &p in raw {
-      match std::str::from_utf8(unsafe { part_bytes(p) }) {
-         Ok(s) => parts.push(s.to_string()),
-         Err(_) => {
-            conn
-               .parser
-               .wbuf
-               .extend_from_slice(b"-ERR invalid UTF-8 in request\r\n");
-            return;
-         }
-      }
-   }
-   let store = Arc::clone(conn.store);
-   let run = move |out: &mut Vec<u8>| {
-      let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
-      crate::commands::ft::execute_ft(&refs, &store, out);
-   };
-   if search_offloaded() {
-      conn.submit(run);
-   } else {
-      run(&mut conn.parser.wbuf);
-   }
-}
-
-pub(super) fn ft_search_raw(conn: &mut Conn<'_>, raw: &[(*const u8, usize)]) {
+fn ft_search_raw(conn: &mut Conn<'_>, raw: &[(*const u8, usize)]) {
    let inline = !search_offloaded()
       || (raw.len() >= 2 && {
          let idx = unsafe { std::str::from_utf8_unchecked(part_bytes(raw[1])) };
@@ -1853,6 +1817,29 @@ pub(super) fn ft_search_raw(conn: &mut Conn<'_>, raw: &[(*const u8, usize)]) {
       conn.submit(run);
    } else {
       run(&mut conn.parser.wbuf);
+   }
+}
+
+#[inline(always)]
+fn write_ok_batch_at(out: &mut Vec<u8>, old_len: usize, count: usize) {
+   const OK_BLOCK: [u8; 256 * 5] = {
+      let mut b = [0u8; 256 * 5];
+      let mut i = 0;
+      while i < 256 * 5 {
+         b[i] = b'+';
+         b[i + 1] = b'O';
+         b[i + 2] = b'K';
+         b[i + 3] = b'\r';
+         b[i + 4] = b'\n';
+         i += 5;
+      }
+      b
+   };
+   out.reserve(count * 5);
+   unsafe {
+      let p = out.as_mut_ptr().add(old_len);
+      std::ptr::copy_nonoverlapping(OK_BLOCK.as_ptr(), p, count * 5);
+      out.set_len(old_len + count * 5);
    }
 }
 

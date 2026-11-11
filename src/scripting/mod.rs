@@ -704,7 +704,7 @@ pub fn lua_to_resp(val: LuaValue, out: &mut Vec<u8>) {
                if let Ok(msg) = s.to_str() {
                   resp::write_simple(out, &msg);
                } else {
-                  resp::write_simple(out, "OK");
+                  resp::write_ok(out);
                }
                return;
             }

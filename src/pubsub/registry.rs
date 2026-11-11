@@ -149,7 +149,8 @@ impl ChannelShard {
       let mut found = false;
       for ch in old_snap.iter() {
          if ch.name.as_ref() == channel {
-            let mut new_slots = ch.slots.clone();
+            let mut new_slots = Vec::with_capacity(ch.slots.len() + 1);
+            new_slots.extend(ch.slots.iter().cloned());
             new_slots.push(slot.clone());
             let workers = extract_workers(&new_slots);
             new_vec.push(ChannelData {

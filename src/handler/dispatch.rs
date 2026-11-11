@@ -1,285 +1,336 @@
 use crate::commands;
-use crate::pubsub::encode_sub_reply;
 use crate::utils::resp;
 
 use super::conn::{Conn, ConnMode};
 use super::pubsub_cmds::pubsub_info;
-use super::subscription::{
-   handle_psubscribe, handle_punsubscribe, handle_subscribe, handle_unsubscribe,
-};
 
-pub fn dispatch(conn: &mut Conn<'_>, parts: &[&str]) {
-   if parts.is_empty() {
-      conn
-         .parser
-         .wbuf
-         .extend_from_slice(b"-ERR empty command\r\n");
-      return;
-   }
-
-   let cmd = parts[0].as_bytes();
-
-   match &conn.mode {
-      ConnMode::Normal => {
-         match cmd.first().map(|b| b.to_ascii_uppercase()) {
-            Some(b'S') => {
-               if cmd_eq(cmd, b"SET") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::string::set(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"SADD") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::set::sadd(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"SCARD") {
-                  return commands::set::scard(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"SMEMBERS") {
-                  return commands::set::smembers(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"SISMEMBER") {
-                  return commands::set::sismember(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"STRLEN") {
-                  return commands::string::strlen(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"SETNX") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::string::setnx(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"SETEX") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::string::setex(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               }
-            }
-            Some(b'G') => {
-               if cmd_eq(cmd, b"GET") {
-                  return commands::string::get(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"GETDEL") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::string::getdel(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"GETSET") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::string::getset(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"GETEX") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::string::getex(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"GETRANGE") {
-                  return commands::string::getrange(parts, conn.store, &mut conn.parser.wbuf);
-               }
-            }
-            Some(b'D') => {
-               if cmd_eq(cmd, b"DEL") {
-                  return commands::keys::del(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"DECR") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::string::decr(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"DECRBY") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::string::decrby(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"DBSIZE") {
-                  return commands::connection::dbsize(conn.store, &mut conn.parser.wbuf);
-               }
-            }
-            Some(b'I') if cmd_eq(cmd, b"INCR") => {
-               let response_start = conn.parser.wbuf.len();
-               commands::string::incr(parts, conn.store, &mut conn.parser.wbuf);
-               capture_if_success(conn, parts, response_start);
-               return;
-            }
-            Some(b'H') => {
-               if cmd_eq(cmd, b"HSET") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::hash::hset(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"HGET") {
-                  return commands::hash::hget(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"HDEL") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::hash::hdel(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"HLEN") {
-                  return commands::hash::hlen(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"HEXISTS") {
-                  return commands::hash::hexists(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"HGETALL") {
-                  return commands::hash::hgetall(parts, conn.store, &mut conn.parser.wbuf);
-               }
-            }
-            Some(b'L') => {
-               if cmd_eq(cmd, b"LPUSH") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::list::lpush(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"LPOP") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::list::lpop(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"LRANGE") {
-                  return commands::list::lrange(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"LLEN") {
-                  return commands::list::llen(parts, conn.store, &mut conn.parser.wbuf);
-               }
-            }
-            Some(b'R') => {
-               if cmd_eq(cmd, b"RPUSH") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::list::rpush(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"RPOP") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::list::rpop(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               }
-            }
-            Some(b'E') => {
-               if cmd_eq(cmd, b"EXPIRE") {
-                  return commands::keys::expire(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"EXISTS") {
-                  return commands::keys::exists_check(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"ECHO") {
-                  return commands::connection::echo(parts, &mut conn.parser.wbuf);
-               }
-            }
-            Some(b'P') => {
-               if cmd_eq(cmd, b"PING") {
-                  return commands::connection::ping(parts, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"PTTL") {
-                  return commands::keys::pttl_check(parts, conn.store, &mut conn.parser.wbuf);
-               }
-            }
-            Some(b'T') => {
-               if cmd_eq(cmd, b"TTL") {
-                  return commands::keys::ttl_check(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"TYPE") {
-                  return commands::connection::type_of(parts, conn.store, &mut conn.parser.wbuf);
-               }
-            }
-            Some(b'M') => {
-               if cmd_eq(cmd, b"MGET") {
-                  return commands::string::mget(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"MSET") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::string::mset(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               }
-            }
-            Some(b'Z') => {
-               if cmd_eq(cmd, b"ZADD") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::zset::zadd(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"ZCARD") {
-                  return commands::zset::zcard(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"ZSCORE") {
-                  return commands::zset::zscore(parts, conn.store, &mut conn.parser.wbuf);
-               } else if cmd_eq(cmd, b"ZREM") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::zset::zrem(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               }
-            }
-            Some(b'J') if cmd.len() == 8 => {
-               if cmd_eq(cmd, b"JSON.SET") {
-                  let response_start = conn.parser.wbuf.len();
-                  commands::json::json_set(parts, conn.store, &mut conn.parser.wbuf);
-                  capture_if_success(conn, parts, response_start);
-                  return;
-               } else if cmd_eq(cmd, b"JSON.GET") {
-                  return commands::json::json_get(parts, conn.store, &mut conn.parser.wbuf);
-               }
-            }
-            _ => {}
-         }
-
-         if cmd_eq(cmd, b"SUBSCRIBE") {
-            handle_subscribe(conn, parts);
-         } else if cmd_eq(cmd, b"PSUBSCRIBE") {
-            handle_psubscribe(conn, parts);
-         } else if cmd_eq(cmd, b"UNSUBSCRIBE") || cmd_eq(cmd, b"PUNSUBSCRIBE") {
-            encode_sub_reply("unsubscribe", "", 0, &mut conn.parser.wbuf);
-         } else if cmd_eq(cmd, b"PUBLISH") {
-            match parts {
-               [_, channel, message] => {
-                  let n = conn.pubsub.publish(channel, message);
-                  resp::write_integer(&mut conn.parser.wbuf, n as i64);
-               }
-               _ => resp::write_wrong_args(&mut conn.parser.wbuf, "publish"),
-            }
-         } else if cmd_eq(cmd, b"PUBSUB") {
-            pubsub_info(parts, conn.pubsub, &mut conn.parser.wbuf);
-         } else {
-            let response_start = conn.parser.wbuf.len();
-            commands::execute(parts, conn.store, &mut conn.parser.wbuf);
-            capture_if_success(conn, parts, response_start);
-         }
+impl<'a> Conn<'a> {
+   pub(super) fn dispatch(&mut self, parts: &[&str]) {
+      if parts.is_empty() {
+         self
+            .parser
+            .wbuf
+            .extend_from_slice(b"-ERR empty command\r\n");
+         return;
       }
 
-      ConnMode::Subscribed { .. } => {
-         if cmd_eq(cmd, b"SUBSCRIBE") {
-            handle_subscribe(conn, parts);
-         } else if cmd_eq(cmd, b"UNSUBSCRIBE") {
-            handle_unsubscribe(conn, parts);
-         } else if cmd_eq(cmd, b"PSUBSCRIBE") {
-            handle_psubscribe(conn, parts);
-         } else if cmd_eq(cmd, b"PUNSUBSCRIBE") {
-            handle_punsubscribe(conn, parts);
-         } else if cmd_eq(cmd, b"ASKING") {
-            // ASKING before a redirected command is a no-op here; the routing
-            // layer enforces the migration fence.
-            conn.asking = true;
-            resp::write_simple(&mut conn.parser.wbuf, "OK");
-         } else if cmd_eq(cmd, b"PING") {
-            let out = &mut conn.parser.wbuf;
-            let msg = parts.get(1).copied().unwrap_or("");
-            if msg.is_empty() {
-               out.extend_from_slice(b"*2\r\n$4\r\npong\r\n$0\r\n\r\n");
-            } else {
-               out.extend_from_slice(b"*2\r\n$4\r\npong\r\n");
-               resp::write_bulk(out, msg);
+      let cmd = parts[0].as_bytes();
+
+      match &self.mode {
+         ConnMode::Normal => {
+            match cmd.first().map(|b| b.to_ascii_uppercase()) {
+               Some(b'S') => {
+                  if cmd_eq(cmd, b"SET") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::string::set(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"SADD") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::set::sadd(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"SCARD") {
+                     return commands::set::scard(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"SMEMBERS") {
+                     return commands::set::smembers(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"SISMEMBER") {
+                     return commands::set::sismember(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"STRLEN") {
+                     return commands::string::strlen(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"SETNX") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::string::setnx(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"SETEX") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::string::setex(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  }
+               }
+               Some(b'G') => {
+                  if cmd_eq(cmd, b"GET") {
+                     return commands::string::get(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"GETDEL") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::string::getdel(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"GETSET") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::string::getset(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"GETEX") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::string::getex(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"GETRANGE") {
+                     return commands::string::getrange(parts, self.store, &mut self.parser.wbuf);
+                  }
+               }
+               Some(b'D') => {
+                  if cmd_eq(cmd, b"DEL") {
+                     return commands::keys::del(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"DECR") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::string::decr(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"DECRBY") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::string::decrby(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"DBSIZE") {
+                     return commands::connection::dbsize(self.store, &mut self.parser.wbuf);
+                  }
+               }
+               Some(b'I') if cmd_eq(cmd, b"INCR") => {
+                  let response_start = self.parser.wbuf.len();
+                  commands::string::incr(parts, self.store, &mut self.parser.wbuf);
+                  self.capture_if_success(parts, response_start);
+                  return;
+               }
+               Some(b'H') => {
+                  if cmd_eq(cmd, b"HSET") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::hash::hset(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"HGET") {
+                     return commands::hash::hget(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"HDEL") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::hash::hdel(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"HLEN") {
+                     return commands::hash::hlen(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"HEXISTS") {
+                     return commands::hash::hexists(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"HGETALL") {
+                     return commands::hash::hgetall(parts, self.store, &mut self.parser.wbuf);
+                  }
+               }
+               Some(b'L') => {
+                  if cmd_eq(cmd, b"LPUSH") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::list::lpush(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"LPOP") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::list::lpop(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"LRANGE") {
+                     return commands::list::lrange(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"LLEN") {
+                     return commands::list::llen(parts, self.store, &mut self.parser.wbuf);
+                  }
+               }
+               Some(b'R') => {
+                  if cmd_eq(cmd, b"RPUSH") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::list::rpush(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"RPOP") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::list::rpop(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  }
+               }
+               Some(b'E') => {
+                  if cmd_eq(cmd, b"EXPIRE") {
+                     return commands::keys::expire(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"EXISTS") {
+                     return commands::keys::exists_check(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"ECHO") {
+                     return commands::connection::echo(parts, &mut self.parser.wbuf);
+                  }
+               }
+               Some(b'P') => {
+                  if cmd_eq(cmd, b"PING") {
+                     return commands::connection::ping(parts, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"PTTL") {
+                     return commands::keys::pttl_check(parts, self.store, &mut self.parser.wbuf);
+                  }
+               }
+               Some(b'T') => {
+                  if cmd_eq(cmd, b"TTL") {
+                     return commands::keys::ttl_check(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"TYPE") {
+                     return commands::connection::type_of(
+                        parts,
+                        self.store,
+                        &mut self.parser.wbuf,
+                     );
+                  }
+               }
+               Some(b'M') => {
+                  if cmd_eq(cmd, b"MGET") {
+                     return commands::string::mget(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"MSET") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::string::mset(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  }
+               }
+               Some(b'Z') => {
+                  if cmd_eq(cmd, b"ZADD") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::zset::zadd(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"ZCARD") {
+                     return commands::zset::zcard(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"ZSCORE") {
+                     return commands::zset::zscore(parts, self.store, &mut self.parser.wbuf);
+                  } else if cmd_eq(cmd, b"ZREM") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::zset::zrem(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  }
+               }
+               Some(b'J') if cmd.len() == 8 => {
+                  if cmd_eq(cmd, b"JSON.SET") {
+                     let response_start = self.parser.wbuf.len();
+                     commands::json::json_set(parts, self.store, &mut self.parser.wbuf);
+                     self.capture_if_success(parts, response_start);
+                     return;
+                  } else if cmd_eq(cmd, b"JSON.GET") {
+                     return commands::json::json_get(parts, self.store, &mut self.parser.wbuf);
+                  }
+               }
+               _ => {}
             }
-         } else if cmd_eq(cmd, b"RESET") || cmd_eq(cmd, b"QUIT") {
-            super::subscription::do_full_unsubscribe(conn);
-            resp::write_simple(&mut conn.parser.wbuf, "OK");
-         } else {
-            conn
-               .parser
-               .wbuf
-               .extend_from_slice(b"-ERR Command not allowed in subscribed state\r\n");
+
+            if cmd_eq(cmd, b"SUBSCRIBE") {
+               self.handle_subscribe(parts);
+            } else if cmd_eq(cmd, b"PSUBSCRIBE") {
+               self.handle_psubscribe(parts);
+            } else if cmd_eq(cmd, b"UNSUBSCRIBE") || cmd_eq(cmd, b"PUNSUBSCRIBE") {
+               self.handle_unsubscribe(parts);
+            } else if cmd_eq(cmd, b"PUBLISH") {
+               match parts {
+                  [_, channel, message] => {
+                     let n = self.pubsub.publish(channel, message);
+                     resp::write_integer(&mut self.parser.wbuf, n as i64);
+                  }
+                  _ => resp::write_wrong_args(&mut self.parser.wbuf, "publish"),
+               }
+            } else if cmd_eq(cmd, b"PUBSUB") {
+               pubsub_info(parts, self.pubsub, &mut self.parser.wbuf);
+            } else {
+               let response_start = self.parser.wbuf.len();
+               commands::execute(parts, self.store, &mut self.parser.wbuf);
+               self.capture_if_success(parts, response_start);
+            }
+         }
+
+         ConnMode::Subscribed { .. } => {
+            if cmd_eq(cmd, b"SUBSCRIBE") {
+               self.handle_subscribe(parts);
+            } else if cmd_eq(cmd, b"UNSUBSCRIBE") {
+               self.handle_unsubscribe(parts);
+            } else if cmd_eq(cmd, b"PSUBSCRIBE") {
+               self.handle_psubscribe(parts);
+            } else if cmd_eq(cmd, b"PUNSUBSCRIBE") {
+               self.handle_punsubscribe(parts);
+            } else if cmd_eq(cmd, b"ASKING") {
+               // ASKING before a redirected command is a no-op here; the routing
+               // layer enforces the migration fence.
+               self.asking = true;
+               resp::write_simple(&mut self.parser.wbuf, "OK");
+            } else if cmd_eq(cmd, b"PING") {
+               let out = &mut self.parser.wbuf;
+               let msg = parts.get(1).copied().unwrap_or("");
+               if msg.is_empty() {
+                  out.extend_from_slice(b"*2\r\n$4\r\npong\r\n$0\r\n\r\n");
+               } else {
+                  out.extend_from_slice(b"*2\r\n$4\r\npong\r\n");
+                  resp::write_bulk(out, msg);
+               }
+            } else if cmd_eq(cmd, b"RESET") || cmd_eq(cmd, b"QUIT") {
+               self.do_full_unsubscribe();
+               resp::write_simple(&mut self.parser.wbuf, "OK");
+            } else {
+               self
+                  .parser
+                  .wbuf
+                  .extend_from_slice(b"-ERR Command not allowed in subscribed state\r\n");
+            }
+         }
+      }
+   }
+
+   #[inline]
+   fn capture_if_success(&mut self, parts: &[&str], response_start: usize) {
+      if !self.store.has_replication() {
+         return;
+      }
+      let response = &self.parser.wbuf[response_start..];
+      if !response.starts_with(b"-") && response != b"$-1\r\n" {
+         self.capture_command_mutation(parts);
+      }
+   }
+
+   fn capture_command_mutation(&mut self, parts: &[&str]) {
+      let Some(command) = parts.first() else { return };
+      let command = command.as_bytes();
+
+      if let Some(key_index) = mutation_key_index(command) {
+         if let Some(key) = parts.get(key_index) {
+            self.store.record_current_value(key);
+         }
+         return;
+      }
+
+      let capture = |conn: &Conn, index: usize| {
+         if let Some(key) = parts.get(index) {
+            conn.store.record_current_value(key);
+         }
+      };
+
+      if command.eq_ignore_ascii_case(b"MSET") || command.eq_ignore_ascii_case(b"MSETNX") {
+         for index in (1..parts.len()).step_by(2) {
+            capture(self, index);
+         }
+      } else if command.eq_ignore_ascii_case(b"RENAME")
+         || command.eq_ignore_ascii_case(b"RENAMENX")
+         || command.eq_ignore_ascii_case(b"SMOVE")
+         || command.eq_ignore_ascii_case(b"LMOVE")
+         || command.eq_ignore_ascii_case(b"RPOPLPUSH")
+      {
+         capture(self, 1);
+         capture(self, 2);
+      } else if command.eq_ignore_ascii_case(b"COPY")
+         || command.eq_ignore_ascii_case(b"BITOP")
+         || command.eq_ignore_ascii_case(b"XGROUP")
+      {
+         capture(self, 2);
+      } else if command.eq_ignore_ascii_case(b"XREADGROUP")
+         && let Some(pos) = parts.iter().position(|p| p.eq_ignore_ascii_case("STREAMS"))
+      {
+         let n = (parts.len() - pos - 1) / 2;
+         for index in pos + 1..pos + 1 + n {
+            capture(self, index);
          }
       }
    }
 }
 
-#[inline]
-fn capture_if_success(conn: &mut Conn, parts: &[&str], response_start: usize) {
-   if !conn.store.has_replication() {
-      return;
-   }
-   let response = &conn.parser.wbuf[response_start..];
-   if !response.starts_with(b"-") && response != b"$-1\r\n" {
-      capture_command_mutation(conn, parts);
-   }
+#[inline(always)]
+pub fn cmd_eq(a: &[u8], upper: &[u8]) -> bool {
+   a.eq_ignore_ascii_case(upper)
 }
 
 /// Key index to capture for replication, or None; dispatches on
@@ -383,53 +434,4 @@ fn mutation_key_index(command: &[u8]) -> Option<usize> {
       _ => false,
    };
    if is_mutation { Some(1) } else { None }
-}
-
-fn capture_command_mutation(conn: &mut Conn, parts: &[&str]) {
-   let Some(command) = parts.first() else { return };
-   let command = command.as_bytes();
-
-   if let Some(key_index) = mutation_key_index(command) {
-      if let Some(key) = parts.get(key_index) {
-         conn.store.record_current_value(key);
-      }
-      return;
-   }
-
-   let capture = |conn: &Conn, index: usize| {
-      if let Some(key) = parts.get(index) {
-         conn.store.record_current_value(key);
-      }
-   };
-
-   if command.eq_ignore_ascii_case(b"MSET") || command.eq_ignore_ascii_case(b"MSETNX") {
-      for index in (1..parts.len()).step_by(2) {
-         capture(conn, index);
-      }
-   } else if command.eq_ignore_ascii_case(b"RENAME")
-      || command.eq_ignore_ascii_case(b"RENAMENX")
-      || command.eq_ignore_ascii_case(b"SMOVE")
-      || command.eq_ignore_ascii_case(b"LMOVE")
-      || command.eq_ignore_ascii_case(b"RPOPLPUSH")
-   {
-      capture(conn, 1);
-      capture(conn, 2);
-   } else if command.eq_ignore_ascii_case(b"COPY")
-      || command.eq_ignore_ascii_case(b"BITOP")
-      || command.eq_ignore_ascii_case(b"XGROUP")
-   {
-      capture(conn, 2);
-   } else if command.eq_ignore_ascii_case(b"XREADGROUP")
-      && let Some(pos) = parts.iter().position(|p| p.eq_ignore_ascii_case("STREAMS"))
-   {
-      let n = (parts.len() - pos - 1) / 2;
-      for index in pos + 1..pos + 1 + n {
-         capture(conn, index);
-      }
-   }
-}
-
-#[inline(always)]
-pub fn cmd_eq(a: &[u8], upper: &[u8]) -> bool {
-   a.eq_ignore_ascii_case(upper)
 }

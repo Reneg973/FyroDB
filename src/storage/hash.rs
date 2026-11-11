@@ -410,7 +410,7 @@ impl Store {
             None => Err("WRONGTYPE"),
          }
       });
-      result.unwrap_or_else(|| Ok(vec![]))
+      result.unwrap_or(Ok(vec![]))
    }
 
    /// Bulk elements stream into `out`; truncation keeps retries idempotent.
@@ -495,7 +495,7 @@ impl Store {
             None => Err("WRONGTYPE"),
          }
       });
-      result.unwrap_or_else(|| Ok(vec![]))
+      result.unwrap_or(Ok(vec![]))
    }
 
    pub fn hkeys_to_buf(&self, key: &str, out: &mut Vec<u8>) -> Result<usize, &'static str> {
@@ -539,10 +539,7 @@ impl Store {
             None => Err("WRONGTYPE"),
          }
       });
-      match result {
-         Some(r) => r,
-         None => Ok(vec![]),
-      }
+      result.unwrap_or(Ok(vec![]))
    }
 
    pub fn hvals_to_buf(&self, key: &str, out: &mut Vec<u8>) -> Result<usize, &'static str> {

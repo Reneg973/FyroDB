@@ -478,8 +478,8 @@ impl SetMemberRef<'_> {
       match self {
          Self::String(s) => s.len(),
          Self::Integer(n) => match n {
-            0 => 1,
-            1.. => n.ilog10() as usize + 1,
+            0..10 => 1,
+            10..=i64::MAX => n.ilog10() as usize + 1,
             _ => n.unsigned_abs().ilog10() as usize + 2,
          },
       }

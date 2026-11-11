@@ -3,6 +3,7 @@ use crate::storage::{
    value::{SmallStr, StoreValue, expiry_from_ms, expiry_from_secs},
 };
 use crate::utils::resp;
+use crate::utils::resp::write_boolean;
 use crate::{parse_float, parse_int, store_ok, wt};
 
 pub fn set(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
@@ -280,10 +281,10 @@ pub fn msetnx(parts: &[&str], store: &Store, out: &mut Vec<u8>) {
             for &[key, _] in &pairs[..failed] {
                store.data.remove(key);
             }
-            out.extend_from_slice(resp::ZERO);
+            write_boolean(out, true);
          } else {
-            out.extend_from_slice(resp::ONE);
-         }
+            write_boolean(out, false);
+         };
       }
       _ => resp::write_wrong_args(out, "msetnx"),
    }

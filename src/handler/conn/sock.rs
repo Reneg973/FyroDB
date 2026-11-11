@@ -92,7 +92,7 @@ impl<'a> Conn<'a> {
                   let id = cmd_id(cmd);
 
                   if id == CmdId::Get && raw.len() == 2 {
-                     dispatch_get_run(self, raw[1]);
+                     self.dispatch_get_run(raw[1]);
                      prefetched = self.parser.pos;
                      continue;
                   }
@@ -104,15 +104,15 @@ impl<'a> Conn<'a> {
                            PairOutcome::ConnError => return false,
                         }
                      }
-                     dispatch_set_run(self, raw[1], raw[2]);
+                     self.dispatch_set_run(raw[1], raw[2]);
                      prefetched = self.parser.pos;
                      continue;
                   }
-                  if id == CmdId::JsonSet && dispatch_json_set_run(self, raw) {
+                  if id == CmdId::JsonSet && self.dispatch_json_set_run(raw) {
                      prefetched = self.parser.pos;
                      continue;
                   }
-                  if id == CmdId::JsonGet && dispatch_json_get_run(self, raw) {
+                  if id == CmdId::JsonGet && self.dispatch_json_get_run(raw) {
                      prefetched = self.parser.pos;
                      continue;
                   }
@@ -139,7 +139,7 @@ impl<'a> Conn<'a> {
                      }
                   }
                }
-               dispatch_raw(self, raw);
+               self.dispatch_raw(raw);
             }
             ParseResult::Incomplete => break,
             ParseResult::Error => return false,

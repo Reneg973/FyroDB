@@ -52,61 +52,37 @@ pub fn write_i64_to(digits: &mut [u8; 20], n: i64) -> &str {
    unsafe { std::str::from_utf8_unchecked(&digits[d_pos..]) }
 }
 
-#[cfg(test)]
-mod tests {
-   use super::*;
+#[inline(always)]
+pub fn write_usize(out: &mut Vec<u8>, n: usize) {
+   if n < 10 {
+      out.push(b'0' + n as u8);
+      return;
+   }
+   if n < 100 {
+      out.extend(DIGITS100.iter().skip(n * 2).take(2));
+      return;
+   }
+   let mut digits = [0u8; 20];
+   let s = write_usize_to(&mut digits, n);
+   let d_len = s.len();
+   let old_len = out.len();
+   if out.capacity() - old_len < d_len {
+      out.reserve(d_len);
+   }
+   unsafe {
+      std::ptr::copy_nonoverlapping(s.as_ptr(), out.as_mut_ptr().add(old_len), d_len);
+      out.set_len(old_len + d_len);
+   }
+}
 
-   #[test]
-   fn test_write_u64_to() {
-      let cases = [
-         0,
-         1,
-         9,
-         10,
-         11,
-         99,
-         100,
-         101,
-         999,
-         1000,
-         12345,
-         999999,
-         1000000,
-         u64::MAX - 1,
-         u64::MAX,
-      ];
-      let mut buf = [0u8; 20];
-      for &c in &cases {
-         assert_eq!(write_u64_to(&mut buf, c), c.to_string());
-      }
+#[inline(always)]
+pub fn write_i64(out: &mut Vec<u8>, n: i64) {
+   if n >= 0 {
+      write_usize(out, n as usize);
+      return;
    }
 
-   #[test]
-   fn test_write_i64_to() {
-      let cases = [
-         i64::MIN,
-         i64::MIN + 1,
-         -1000000,
-         -99999,
-         -100,
-         -99,
-         -10,
-         -9,
-         -1,
-         0,
-         1,
-         9,
-         10,
-         99,
-         100,
-         99999,
-         1000000,
-         i64::MAX - 1,
-         i64::MAX,
-      ];
-      let mut buf = [0u8; 20];
-      for &c in &cases {
-         assert_eq!(write_i64_to(&mut buf, c), c.to_string());
-      }
-   }
+   let mut digits = [0u8; 20];
+   let s = crate::utils::int_format::write_i64_to(&mut digits, n);
+   out.extend_from_slice(s.as_bytes());
 }

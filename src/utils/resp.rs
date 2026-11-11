@@ -1,3 +1,5 @@
+use crate::utils::int_format::{DIGITS100, write_i64, write_usize};
+
 #[inline(always)]
 pub fn fast_parse_f64_bytes(b: &[u8]) -> Option<f64> {
    if b.is_empty() {
@@ -55,11 +57,9 @@ pub fn fast_parse_f64(s: &str) -> Option<f64> {
 
 pub const OK: &[u8] = b"+OK\r\n";
 pub const NIL: &[u8] = b"$-1\r\n";
-pub const ZERO: &[u8] = b":0\r\n";
-pub const ONE: &[u8] = b":1\r\n";
 pub const PONG: &[u8] = b"+PONG\r\n";
 
-static INT_CACHE: [&[u8]; 10] = [
+pub const INT_CACHE: [&[u8]; 10] = [
    b":0\r\n", b":1\r\n", b":2\r\n", b":3\r\n", b":4\r\n", b":5\r\n", b":6\r\n", b":7\r\n",
    b":8\r\n", b":9\r\n",
 ];
@@ -77,6 +77,18 @@ const RESP_BULK_HEADERS: [u32; 10] = [
    u32::from_ne_bytes(*b"$9\r\n"),
 ];
 const CRLF_U16: u16 = u16::from_ne_bytes(*b"\r\n");
+
+#[inline(always)]
+pub(crate) fn is_crlf_at(p: *const u8, n: usize) -> bool {
+   unsafe { p.add(n).cast::<u16>().read_unaligned() == CRLF_U16 }
+}
+
+#[inline(always)]
+pub(crate) fn write_crlf_at(p: *mut u8, n: usize) {
+   unsafe {
+      p.add(n).cast::<u16>().write_unaligned(CRLF_U16);
+   }
+}
 
 #[inline(always)]
 pub fn format_usize_digits(mut n: usize, buf: &mut [u8]) -> &[u8] {
@@ -105,7 +117,7 @@ pub unsafe fn write_bulk_raw(dst: *mut u8, s: &[u8]) -> usize {
          let header = 0x0A0D_3024u32 | ((len as u32) << 8);
          dst.cast::<u32>().write_unaligned(header);
          std::ptr::copy_nonoverlapping(s.as_ptr(), dst.add(4), len);
-         dst.add(4 + len).cast::<u16>().write_unaligned(CRLF_U16);
+         write_crlf_at(dst, 4 + len);
          total
       } else if len < 100 {
          let total = 7 + len;
@@ -115,7 +127,7 @@ pub unsafe fn write_bulk_raw(dst: *mut u8, s: &[u8]) -> usize {
          dst.cast::<u32>().write_unaligned(header);
          *dst.add(4) = b'\n';
          std::ptr::copy_nonoverlapping(s.as_ptr(), dst.add(5), len);
-         dst.add(5 + len).cast::<u16>().write_unaligned(CRLF_U16);
+         write_crlf_at(dst, 5 + len);
          total
       } else {
          let mut p = dst;
@@ -125,7 +137,7 @@ pub unsafe fn write_bulk_raw(dst: *mut u8, s: &[u8]) -> usize {
          let num_str = format_usize_digits(len, &mut num_buf);
          std::ptr::copy_nonoverlapping(num_str.as_ptr(), p, num_str.len());
          p = p.add(num_str.len());
-         p.cast::<u16>().write_unaligned(CRLF_U16);
+         write_crlf_at(p, 0);
          p = p.add(2);
          std::ptr::copy_nonoverlapping(s.as_ptr(), p, len);
          p = p.add(len);
@@ -135,6 +147,7 @@ pub unsafe fn write_bulk_raw(dst: *mut u8, s: &[u8]) -> usize {
       }
    }
 }
+
 #[inline]
 pub fn write_ok(out: &mut Vec<u8>) {
    out.extend_from_slice(OK);
@@ -181,7 +194,7 @@ pub fn write_bulk_bytes(out: &mut Vec<u8>, s: &[u8]) {
          p.cast::<u32>()
             .write_unaligned(*RESP_BULK_HEADERS.get_unchecked(len));
          std::ptr::copy_nonoverlapping(s.as_ptr(), p.add(4), len);
-         p.add(4 + len).cast::<u16>().write_unaligned(CRLF_U16);
+         write_crlf_at(p, 4 + len);
          out.set_len(old_len + total);
       }
       return;
@@ -196,22 +209,17 @@ pub fn write_bulk_bytes(out: &mut Vec<u8>, s: &[u8]) {
          let p = out.as_mut_ptr().add(old_len);
          *p = b'$';
          let d_idx = len * 2;
-         *p.add(1) = DIGITS100[d_idx];
-         *p.add(2) = DIGITS100[d_idx + 1];
-         p.add(3)
-            .cast::<u16>()
-            .write_unaligned(u16::from_ne_bytes(*b"\r\n"));
+         std::ptr::copy_nonoverlapping(DIGITS100.as_ptr().add(d_idx), p.add(1), 2);
+         write_crlf_at(p, 3);
          std::ptr::copy_nonoverlapping(s.as_ptr(), p.add(5), len);
-         p.add(5 + len)
-            .cast::<u16>()
-            .write_unaligned(u16::from_ne_bytes(*b"\r\n"));
+         write_crlf_at(p, 5 + len);
          out.set_len(old_len + total);
       }
       return;
    }
    out.reserve(1 + 10 + 2 + len + 2);
    out.push(b'$');
-   write_usize(out, s.len());
+   write_usize(out, len);
    out.extend_from_slice(b"\r\n");
    out.extend_from_slice(s);
    out.extend_from_slice(b"\r\n");
@@ -230,7 +238,7 @@ pub fn write_integer(out: &mut Vec<u8>, n: i64) {
 
 #[inline]
 pub fn write_boolean(out: &mut Vec<u8>, b: bool) {
-   out.extend_from_slice(if b { ONE } else { ZERO });
+   out.extend_from_slice(INT_CACHE[b as usize]);
 }
 
 #[inline]
@@ -277,6 +285,7 @@ pub fn write_opt_array(out: &mut Vec<u8>, items: &[Option<String>]) {
 
 #[inline]
 pub fn write_err(out: &mut Vec<u8>, msg: &str) {
+   out.reserve(msg.len() + 7);
    out.extend_from_slice(b"-ERR ");
    out.extend_from_slice(msg.as_bytes());
    out.extend_from_slice(b"\r\n");
@@ -305,6 +314,7 @@ pub fn write_wrong_type(out: &mut Vec<u8>) {
 
 #[inline]
 pub fn write_wrong_args(out: &mut Vec<u8>, cmd: &str) {
+   out.reserve(cmd.len() + 47);
    out.extend_from_slice(b"-ERR wrong number of arguments for '");
    out.extend_from_slice(cmd.as_bytes());
    out.extend_from_slice(b"' command\r\n");
@@ -312,45 +322,8 @@ pub fn write_wrong_args(out: &mut Vec<u8>, cmd: &str) {
 
 #[inline]
 pub fn write_simple(out: &mut Vec<u8>, s: &str) {
+   out.reserve(s.len() + 3);
    out.push(b'+');
    out.extend_from_slice(s.as_bytes());
    out.extend_from_slice(b"\r\n");
-}
-
-use crate::utils::int_format::DIGITS100;
-
-#[inline(always)]
-pub fn write_usize(out: &mut Vec<u8>, n: usize) {
-   if n < 100 {
-      if n < 10 {
-         out.push(b'0' + n as u8);
-      } else {
-         let rem = n * 2;
-         out.extend_from_slice(&DIGITS100[rem..rem + 2]);
-      }
-      return;
-   }
-   let mut digits = [0u8; 20];
-   let s = crate::utils::int_format::write_usize_to(&mut digits, n);
-   let d_len = s.len();
-   let old_len = out.len();
-   if out.capacity() - old_len < d_len {
-      reserve_resp(out, d_len);
-   }
-   unsafe {
-      std::ptr::copy_nonoverlapping(s.as_ptr(), out.as_mut_ptr().add(old_len), d_len);
-      out.set_len(old_len + d_len);
-   }
-}
-
-#[inline(always)]
-pub fn write_i64(out: &mut Vec<u8>, n: i64) {
-   if n >= 0 {
-      write_usize(out, n as usize);
-      return;
-   }
-
-   let mut digits = [0u8; 20];
-   let s = crate::utils::int_format::write_i64_to(&mut digits, n);
-   out.extend_from_slice(s.as_bytes());
 }

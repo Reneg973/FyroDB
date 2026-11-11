@@ -1,3 +1,5 @@
+use crate::utils::resp::write_crlf_at;
+
 pub(crate) const SMALL_STR_CAP: usize = 23;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -44,8 +46,6 @@ pub struct SmallStr {
    data: [u8; SMALL_STR_CAP],
    len: Tag,
 }
-
-const CRLF_U16: u16 = u16::from_ne_bytes(*b"\r\n");
 
 impl SmallStr {
    #[inline]
@@ -247,7 +247,7 @@ impl SmallStr {
                if len == 9 {
                   *p.add(12) = *self.data.as_ptr().add(8);
                }
-               p.add(4 + len).cast::<u16>().write_unaligned(CRLF_U16);
+               write_crlf_at(p, 4 + len);
                out.set_len(old_len + total);
             }
             return;
@@ -286,7 +286,7 @@ impl SmallStr {
                   std::ptr::write_unaligned(dst.add(len - 8).cast::<u64>(), w2);
                }
 
-               p.add(5 + len).cast::<u16>().write_unaligned(CRLF_U16);
+               write_crlf_at(p, 5 + len);
                out.set_len(old_len + total);
             }
             return;
@@ -318,7 +318,7 @@ impl SmallStr {
             if len == 9 {
                *p.add(12) = *self.data.as_ptr().add(8);
             }
-            p.add(4 + len).cast::<u16>().write_unaligned(CRLF_U16);
+            write_crlf_at(p, 4 + len);
             total
          } else if len <= SMALL_STR_CAP {
             let total = 7 + len;
@@ -347,7 +347,7 @@ impl SmallStr {
                std::ptr::write_unaligned(dst.add(len - 8).cast::<u64>(), w2);
             }
 
-            p.add(5 + len).cast::<u16>().write_unaligned(CRLF_U16);
+            write_crlf_at(p, 5 + len);
             total
          } else {
             let bytes = self.as_bytes();
