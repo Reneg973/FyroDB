@@ -1,6 +1,5 @@
 pub mod conn;
 pub mod dispatch;
-pub mod net;
 pub mod pubsub_cmds;
 pub mod subscription;
 #[cfg(feature = "io-uring")]

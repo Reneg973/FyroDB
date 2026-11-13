@@ -2,7 +2,7 @@ use foldhash::HashSet;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use crate::handler::net::Stream;
+use fyro_net::Stream;
 
 use crate::pubsub::{PubSub, SubSlot, WorkerNotifier};
 use crate::storage::store::Store;

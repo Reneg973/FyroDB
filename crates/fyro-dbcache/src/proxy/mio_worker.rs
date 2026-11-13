@@ -1,14 +1,18 @@
 // Non-blocking mio proxy worker.
 // Multiplexes connections with inline cache hits and a blocking sub-pool.
 
-use mio::net::{TcpListener, TcpStream};
+#[cfg(all(unix, feature = "unix-sockets"))]
+use mio::net::UnixListener;
 use mio::{Events, Interest, Poll, Token, Waker};
+
+use fyro_net::{Listener as ProxyListener, Stream as ProxyStream};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, mpsc};
 
 use foldhash::fast::FixedState;
 
+use super::stream::ClientStream;
 use crate::bus::InvalidationBus;
 use crate::cache::{DbCacheManager, EncodedResult, coarse_now_ms};
 use crate::config::DbCacheConfig;
@@ -25,6 +29,45 @@ const FLUSH_THRESH: usize = 32 * 1024;
 const MAX_NAMED: usize = 512;
 const PORTAL_SUSPENDED: [u8; 5] = [b's', 0, 0, 0, 4];
 
+pub(super) fn bind_tcp_listener(addr: std::net::SocketAddr) -> io::Result<ProxyListener> {
+   use socket2::{Domain, Protocol, Socket, Type};
+   let sock = Socket::new(
+      if addr.is_ipv6() {
+         Domain::IPV6
+      } else {
+         Domain::IPV4
+      },
+      Type::STREAM,
+      Some(Protocol::TCP),
+   )?;
+   sock.set_reuse_address(true)?;
+   #[cfg(unix)]
+   sock.set_reuse_port(true)?;
+   sock.set_nonblocking(true)?;
+   sock.bind(&addr.into())?;
+   sock.listen(1024)?;
+   let std_listener: std::net::TcpListener = sock.into();
+   Ok(ProxyListener::Tcp(mio::net::TcpListener::from_std(
+      std_listener,
+   )))
+}
+
+#[cfg(all(unix, feature = "unix-sockets"))]
+pub(super) fn bind_unix_listener(path: &str) -> io::Result<ProxyListener> {
+   super::prepare_unix_socket(path)?;
+   let listener = std::os::unix::net::UnixListener::bind(path)?;
+   listener.set_nonblocking(true)?;
+   Ok(ProxyListener::Unix(UnixListener::from_std(listener)))
+}
+
+#[cfg(not(all(unix, feature = "unix-sockets")))]
+pub(super) fn bind_unix_listener(_path: &str) -> io::Result<ProxyListener> {
+   Err(io::Error::new(
+      io::ErrorKind::Unsupported,
+      "unix socket listen addresses require a unix platform and the 'unix-sockets' feature",
+   ))
+}
+
 // ────────────────────────────────────── read buffer
 
 struct ReadBuf {
@@ -40,7 +83,7 @@ impl ReadBuf {
       }
    }
 
-   fn fill(&mut self, stream: &mut TcpStream) -> io::Result<()> {
+   fn fill(&mut self, stream: &mut impl Read) -> io::Result<()> {
       if self.consumed > 16384 && self.consumed >= self.buf.len() / 2 {
          self.buf.drain(..self.consumed);
          self.consumed = 0;
@@ -152,7 +195,7 @@ impl WriteBuf {
       self.buf.len().saturating_sub(self.pos)
    }
 
-   fn flush_to(&mut self, stream: &mut TcpStream) -> io::Result<bool> {
+   fn flush_to(&mut self, stream: &mut impl Write) -> io::Result<bool> {
       while self.pos < self.buf.len() {
          match stream.write(&self.buf[self.pos..]) {
             Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")),
@@ -955,7 +998,7 @@ enum ConnState {
 }
 
 struct ProxyConn {
-   stream: TcpStream,
+   stream: ProxyStream,
    state: ConnState,
    rbuf: ReadBuf,
    wbuf: WriteBuf,
@@ -963,7 +1006,7 @@ struct ProxyConn {
 }
 
 impl ProxyConn {
-   fn new(stream: TcpStream) -> Self {
+   fn new(stream: ProxyStream) -> Self {
       Self {
          stream,
          state: ConnState::Startup,
@@ -982,7 +1025,7 @@ pub(super) struct BlockingPool {
 
 struct PoolJob {
    conn_id: usize,
-   stream: std::net::TcpStream,
+   stream: ClientStream,
    config: Arc<DbCacheConfig>,
    mgr: Arc<DbCacheManager>,
    pool: Arc<UpstreamPool>,
@@ -1026,7 +1069,7 @@ impl BlockingPool {
    pub(super) fn submit(
       &self,
       conn_id: usize,
-      stream: std::net::TcpStream,
+      stream: ClientStream,
       config: Arc<DbCacheConfig>,
       mgr: Arc<DbCacheManager>,
       pool: Arc<UpstreamPool>,
@@ -1054,7 +1097,7 @@ impl BlockingPool {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_proxy_worker(
-   mut listener: TcpListener,
+   mut listener: ProxyListener,
    mgr: Arc<DbCacheManager>,
    config: Arc<DbCacheConfig>,
    pool: Arc<UpstreamPool>,
@@ -1275,14 +1318,20 @@ fn offload_conn(
    if raw_fd < 0 {
       return false;
    }
-   let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
-   if std_stream.set_nonblocking(false).is_err() {
+   let client_stream = match &conn.stream {
+      ProxyStream::Tcp(_) => ClientStream::Tcp(unsafe { std::net::TcpStream::from_raw_fd(raw_fd) }),
+      #[cfg(all(unix, feature = "unix-sockets"))]
+      ProxyStream::Unix(_) => {
+         ClientStream::Unix(unsafe { std::os::unix::net::UnixStream::from_raw_fd(raw_fd) })
+      }
+   };
+   if client_stream.set_nonblocking(false).is_err() {
       return false;
    }
    conn.state = ConnState::Offloaded;
    blocking_pool.submit(
       id,
-      std_stream,
+      client_stream,
       Arc::clone(config),
       Arc::clone(mgr),
       Arc::clone(pool),
@@ -1405,7 +1454,7 @@ fn handle_active_event(conn: &mut ProxyConn) -> bool {
 }
 
 fn do_accept(
-   listener: &mut TcpListener,
+   listener: &mut ProxyListener,
    registry: &mio::Registry,
    conns: &mut Vec<Option<ProxyConn>>,
    free: &mut Vec<usize>,
@@ -1413,12 +1462,18 @@ fn do_accept(
 ) {
    loop {
       match listener.accept() {
-         Ok((mut stream, _)) => {
-            let _ = socket2::SockRef::from(&stream).set_tcp_nodelay(true);
-            let _ = socket2::SockRef::from(&stream).set_send_buffer_size(512 * 1024);
-            let _ = socket2::SockRef::from(&stream).set_recv_buffer_size(512 * 1024);
-            #[cfg(target_os = "linux")]
-            let _ = socket2::SockRef::from(&stream).set_tcp_quickack(true);
+         Ok(mut stream) => {
+            match &stream {
+               ProxyStream::Tcp(tcp) => {
+                  let _ = socket2::SockRef::from(tcp).set_tcp_nodelay(true);
+                  let _ = socket2::SockRef::from(tcp).set_send_buffer_size(512 * 1024);
+                  let _ = socket2::SockRef::from(tcp).set_recv_buffer_size(512 * 1024);
+                  #[cfg(target_os = "linux")]
+                  let _ = socket2::SockRef::from(tcp).set_tcp_quickack(true);
+               }
+               #[cfg(all(unix, feature = "unix-sockets"))]
+               ProxyStream::Unix(_) => {}
+            }
             let id = alloc_slot(free, next_id, conns);
             if registry
                .register(&mut stream, Token(id + CONN_BASE), Interest::READABLE)

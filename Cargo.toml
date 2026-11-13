@@ -10,6 +10,7 @@ members = [
     ".",
     "crates/customhash",
     "crates/rust-zmalloc",
+    "crates/fyro-net",
     "crates/fyro-vector",
     "crates/fyro-dbcache",
 ]
@@ -34,6 +35,7 @@ overflow-checks = false
 
 [dependencies]
 customhash = { path = "crates/customhash" }
+fyro-net = { path = "crates/fyro-net" }
 fyro-vector = { path = "crates/fyro-vector" }
 fyro-dbcache = { path = "crates/fyro-dbcache" }
 rust-zmalloc = { path = "crates/rust-zmalloc" }
@@ -67,7 +69,7 @@ path = "src/main.rs"
 io-uring = ["dep:io-uring"]
 profiling = ["dep:pprof"]
 bench-tools = []
-unix-sockets = []
+unix-sockets = ["fyro-net/unix-sockets", "fyro-dbcache/unix-sockets"]
 unix = ["unix-sockets"]
 unix-socket = ["unix-sockets"]
 

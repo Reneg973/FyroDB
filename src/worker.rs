@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::handler::Conn;
 use crate::handler::conn::ConnMode;
-use crate::handler::net::{Listener, Stream};
+use fyro_net::{Listener, Stream};
 use crate::pubsub::{PubSub, WorkerNotifier};
 use crate::storage::store::Store;
 use crate::storage::value::tick_clock;
@@ -129,15 +129,17 @@ pub fn run_worker(
                         continue;
                      }
 
-                     match stream {
-                        Stream::Tcp(ref tcp) => {
-                           let sock_ref = socket2::SockRef::from(tcp);
-                           let _ = sock_ref.set_tcp_nodelay(true);
-                           #[cfg(target_os = "linux")]
-                           let _ = sock_ref.set_tcp_quickack(true);
-                        }
-                        #[cfg(feature = "unix-sockets")]
-                        Stream::Unix(_) => {}
+                     // Unix streams need no TCP-specific setup. `if let`
+                     // keeps this compiling whether or not the Stream::Unix
+                     // variant is enabled via fyro-net's unix-sockets
+                     // feature (which fyro-dbcache may enable independently
+                     // of this crate's own feature).
+                     #[allow(irrefutable_let_patterns)]
+                     if let Stream::Tcp(ref tcp) = stream {
+                        let sock_ref = socket2::SockRef::from(tcp);
+                        let _ = sock_ref.set_tcp_nodelay(true);
+                        #[cfg(target_os = "linux")]
+                        let _ = sock_ref.set_tcp_quickack(true);
                      }
                      let id = alloc_slot(&mut free, &mut next_token, &mut conns);
                      poll

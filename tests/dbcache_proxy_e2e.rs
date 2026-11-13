@@ -1869,3 +1869,79 @@ fn make_one_row_result_local() -> fyro_dbcache::DbResultSet {
       rows_affected: 1,
    }
 }
+
+// ---------------------------------------------------------- unix listener
+
+#[cfg(all(unix, feature = "unix-sockets"))]
+#[test]
+fn unix_socket_listener_serves_pg_protocol() {
+   let store = Arc::new(Store::new());
+   let manager = Arc::new(DbCacheManager::new(store.clone()));
+   store.install_dbcache_manager(Arc::clone(&manager));
+
+   let dir = std::env::temp_dir().join(format!(
+      "fyrodb-pg-unix-{}-{}",
+      std::process::id(),
+      free_port()
+   ));
+   std::fs::create_dir_all(&dir).expect("create socket dir");
+   let port = 15432u16;
+   let config = DbCacheConfig {
+      enabled: true,
+      mode: DbProxyMode::Dual,
+      upstream_addr: None,
+      listen_addr: format!("unix:{}", dir.display()),
+      listen_port: port,
+      ..DbCacheConfig::default()
+   };
+   start_proxy_listener(config, Arc::clone(&manager)).expect("start unix proxy");
+
+   // The listener binds <dir>/.s.PGSQL.<port>.
+   let sock_path = dir.join(format!(".s.PGSQL.{port}"));
+   let deadline = Instant::now() + Duration::from_secs(5);
+   while !sock_path.exists() {
+      assert!(
+         Instant::now() < deadline,
+         "proxy did not create {sock_path:?}"
+      );
+      thread::sleep(Duration::from_millis(10));
+   }
+
+   let stream = std::os::unix::net::UnixStream::connect(&sock_path).expect("connect unix socket");
+   stream
+      .set_read_timeout(Some(Duration::from_secs(5)))
+      .unwrap();
+   let mut writer = stream.try_clone().unwrap();
+   let mut reader = BufReader::new(stream);
+
+   // Startup message, protocol v3, no upstream configured.
+   let mut payload = Vec::new();
+   payload.extend_from_slice(&PROTOCOL_VERSION_3.to_be_bytes());
+   payload.extend_from_slice(b"user\0postgres\0database\0test\0\0");
+   writer
+      .write_all(&((payload.len() + 4) as i32).to_be_bytes())
+      .unwrap();
+   writer.write_all(&payload).unwrap();
+
+   loop {
+      let Some((tag, _body)) = read_tagged(&mut reader) else {
+         panic!("proxy closed during startup");
+      };
+      if tag == b'Z' {
+         break;
+      }
+   }
+
+   // An empty query still exercises the full request path.
+   write_msg(&mut writer, b'Q', b"\0").unwrap();
+   loop {
+      let Some((tag, _)) = read_tagged(&mut reader) else {
+         panic!("proxy closed before ReadyForQuery");
+      };
+      if tag == b'Z' {
+         break;
+      }
+   }
+
+   let _ = std::fs::remove_dir_all(&dir);
+}

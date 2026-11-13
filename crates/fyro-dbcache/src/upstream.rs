@@ -4,6 +4,8 @@ use crate::row::{ColumnInfo, DbResultSet, DbRow, DbValue};
 use parking_lot::Mutex;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(all(unix, feature = "unix-sockets"))]
+use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,6 +53,8 @@ pub struct RelayOutcome {
 pub enum TransportStream {
    Plain(TcpStream),
    Tls(native_tls::TlsStream<TcpStream>),
+   #[cfg(all(unix, feature = "unix-sockets"))]
+   Unix(UnixStream),
 }
 
 impl TransportStream {
@@ -58,6 +62,8 @@ impl TransportStream {
       match self {
          Self::Plain(s) => s.set_read_timeout(timeout),
          Self::Tls(s) => s.get_ref().set_read_timeout(timeout),
+         #[cfg(all(unix, feature = "unix-sockets"))]
+         Self::Unix(s) => s.set_read_timeout(timeout),
       }
    }
 }
@@ -67,6 +73,8 @@ impl Read for TransportStream {
       match self {
          Self::Plain(s) => s.read(buf),
          Self::Tls(s) => s.read(buf),
+         #[cfg(all(unix, feature = "unix-sockets"))]
+         Self::Unix(s) => s.read(buf),
       }
    }
 }
@@ -76,6 +84,8 @@ impl Write for TransportStream {
       match self {
          Self::Plain(s) => s.write(buf),
          Self::Tls(s) => s.write(buf),
+         #[cfg(all(unix, feature = "unix-sockets"))]
+         Self::Unix(s) => s.write(buf),
       }
    }
 
@@ -83,6 +93,8 @@ impl Write for TransportStream {
       match self {
          Self::Plain(s) => s.flush(),
          Self::Tls(s) => s.flush(),
+         #[cfg(all(unix, feature = "unix-sockets"))]
+         Self::Unix(s) => s.flush(),
       }
    }
 }
@@ -130,6 +142,38 @@ impl UpstreamConnection {
 
    fn open(target: &str) -> io::Result<Self> {
       let parsed = UpstreamTarget::parse(target);
+      let transport = if parsed.is_unix() {
+         Self::connect_unix(&parsed)?
+      } else {
+         Self::connect_tcp(&parsed)?
+      };
+
+      let shared = SharedTransport(Arc::new(Mutex::new(transport)));
+      let reader = FrameReader::new(BufReader::with_capacity(32 * 1024, shared.clone()));
+      Ok(Self {
+         writer: shared,
+         reader,
+         auth_ok: Vec::new(),
+         post_auth: Vec::new(),
+         required_password: false,
+      })
+   }
+
+   // PostgreSQL never negotiates TLS over Unix sockets, so sslmode is ignored.
+   #[cfg(all(unix, feature = "unix-sockets"))]
+   fn connect_unix(parsed: &UpstreamTarget) -> io::Result<TransportStream> {
+      UnixStream::connect(parsed.socket_path()).map(TransportStream::Unix)
+   }
+
+   #[cfg(not(all(unix, feature = "unix-sockets")))]
+   fn connect_unix(_parsed: &UpstreamTarget) -> io::Result<TransportStream> {
+      Err(io::Error::new(
+         io::ErrorKind::InvalidInput,
+         "unix socket upstream requires a unix platform and the 'unix-sockets' feature",
+      ))
+   }
+
+   fn connect_tcp(parsed: &UpstreamTarget) -> io::Result<TransportStream> {
       let socket_addr = parsed
          .addr()
          .to_socket_addrs()?
@@ -175,16 +219,7 @@ impl UpstreamConnection {
       } else {
          TransportStream::Plain(tcp)
       };
-
-      let shared = SharedTransport(Arc::new(Mutex::new(transport)));
-      let reader = FrameReader::new(BufReader::with_capacity(32 * 1024, shared.clone()));
-      Ok(Self {
-         writer: shared,
-         reader,
-         auth_ok: Vec::new(),
-         post_auth: Vec::new(),
-         required_password: false,
-      })
+      Ok(transport)
    }
 
    // Opens a session with the proxy's own credentials instead of relaying a
@@ -360,9 +395,9 @@ impl UpstreamConnection {
    }
 
    // Relays startup and authentication frames verbatim upstream.
-   pub fn handshake<R: Read>(
+   pub fn handshake<R: Read, W: Write>(
       target: &str,
-      client: &mut TcpStream,
+      client: &mut W,
       client_reader: &mut FrameReader<R>,
       startup_frame: &[u8],
    ) -> Result<Self, HandshakeError> {
@@ -598,7 +633,16 @@ impl UpstreamConnection {
 }
 
 pub fn send_cancel(target: &str, frame: &[u8]) {
-   let addr = normalize_target(target);
+   let parsed = UpstreamTarget::parse(target);
+   #[cfg(all(unix, feature = "unix-sockets"))]
+   if parsed.is_unix() {
+      if let Ok(mut stream) = UnixStream::connect(parsed.socket_path()) {
+         let _ = stream.write_all(frame);
+         let _ = stream.flush();
+      }
+      return;
+   }
+   let addr = parsed.addr();
    let Ok(mut addrs) = addr.to_socket_addrs() else {
       return;
    };
@@ -609,10 +653,6 @@ pub fn send_cancel(target: &str, frame: &[u8]) {
       let _ = stream.write_all(frame);
       let _ = stream.flush();
    }
-}
-
-fn normalize_target(target: &str) -> String {
-   UpstreamTarget::parse(target).addr()
 }
 
 fn command_tag(body: &[u8]) -> String {

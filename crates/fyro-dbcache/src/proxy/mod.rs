@@ -1,10 +1,12 @@
 pub(crate) mod mio_worker;
 mod session;
+pub(crate) mod stream;
 
 use crate::bus::InvalidationBus;
 use crate::cache::DbCacheManager;
 use crate::config::{DbCacheConfig, DbProxyMode};
 use crate::pool::{PoolLimits, UpstreamPool};
+use crate::proxy::stream::ClientStream;
 use std::io;
 use std::net::TcpListener;
 use std::sync::{Arc, mpsc};
@@ -33,14 +35,12 @@ pub(crate) const CATALOG_VIEWS_SQL: &str = "SELECT v.relname, pg_get_viewdef(v.o
       AND d.refclassid = 'pg_class'::regclass AND d.deptype = 'n' \
    WHERE r.rulename = '_RETURN'";
 
-// Spawns the background TCP listener for PostgreSQL wire proxy caching.
-pub fn start_proxy_listener(
-   config: DbCacheConfig,
-   cache_mgr: Arc<DbCacheManager>,
-) -> io::Result<thread::JoinHandle<()>> {
-   let listener = TcpListener::bind(&config.listen_addr)?;
-   let listen_addr = config.listen_addr.clone();
+struct ProxyShared {
+   pool: Arc<UpstreamPool>,
+   bus: Option<Arc<InvalidationBus>>,
+}
 
+fn shared_state(config: &DbCacheConfig, cache_mgr: &Arc<DbCacheManager>) -> ProxyShared {
    let pool = Arc::new(UpstreamPool::new(PoolLimits {
       max_idle: config.pool_max_idle,
       idle_timeout: Duration::from_millis(config.pool_idle_timeout_ms),
@@ -48,7 +48,7 @@ pub fn start_proxy_listener(
    let bus = if config.mode == DbProxyMode::Dual {
       match config.bus_path.as_deref() {
          Some(path) => {
-            match crate::bus::start(path, Arc::clone(&cache_mgr), config.key_prefix.clone()) {
+            match crate::bus::start(path, Arc::clone(cache_mgr), config.key_prefix.clone()) {
                Ok(bus) => Some(bus),
                Err(error) => {
                   eprintln!("fyrodb-dbproxy: invalidation bus unavailable ({path}): {error}");
@@ -61,9 +61,16 @@ pub fn start_proxy_listener(
    } else {
       None
    };
+   ProxyShared { pool, bus }
+}
 
-   let janitor_pool = Arc::clone(&pool);
-   let janitor_mgr = Arc::clone(&cache_mgr);
+fn spawn_janitor(
+   config: &DbCacheConfig,
+   pool: &Arc<UpstreamPool>,
+   cache_mgr: &Arc<DbCacheManager>,
+) {
+   let janitor_pool = Arc::clone(pool);
+   let janitor_mgr = Arc::clone(cache_mgr);
    let janitor_prefix = config.key_prefix.clone();
    let interval = Duration::from_millis(if config.pool_max_idle > 0 {
       (config.pool_idle_timeout_ms / 2).clamp(1_000, 5_000)
@@ -88,6 +95,68 @@ pub fn start_proxy_listener(
             }
          }
       });
+}
+
+fn spawn_client(
+   client: ClientStream,
+   config: DbCacheConfig,
+   mgr: Arc<DbCacheManager>,
+   pool: Arc<UpstreamPool>,
+   bus: Option<Arc<InvalidationBus>>,
+) {
+   if let Err(e) = thread::Builder::new()
+      .name("fyrodb-dbconn".into())
+      .stack_size(session::CLIENT_STACK)
+      .spawn(move || {
+         if let Err(e) = session::handle_client(client, config, mgr, pool, bus)
+            && e.kind() != io::ErrorKind::UnexpectedEof
+         {
+            eprintln!("fyrodb-dbproxy client error: {e}");
+         }
+      })
+   {
+      eprintln!("fyrodb-dbproxy: spawn failed: {e}");
+   }
+}
+
+// Refuses to steal a live socket and clears a stale socket file left behind by
+// a previous run, mirroring the invalidation bus broker behavior.
+#[cfg(all(unix, feature = "unix-sockets"))]
+fn prepare_unix_socket(path: &str) -> io::Result<()> {
+   use std::os::unix::net::UnixStream;
+   if let Some(parent) = std::path::Path::new(path).parent() {
+      std::fs::create_dir_all(parent)?;
+   }
+   if UnixStream::connect(path).is_ok() {
+      return Err(io::Error::new(
+         io::ErrorKind::AddrInUse,
+         format!("unix socket already in use: {path}"),
+      ));
+   }
+   let _ = std::fs::remove_file(path);
+   Ok(())
+}
+
+// Spawns the background TCP listener for PostgreSQL wire proxy caching.
+// listen_addr is "host:port" for TCP or "unix:<dir>" for a Unix socket, in
+// which case the listener binds <dir>/.s.PGSQL.<listen_port>.
+pub fn start_proxy_listener(
+   config: DbCacheConfig,
+   cache_mgr: Arc<DbCacheManager>,
+) -> io::Result<thread::JoinHandle<()>> {
+   if config.unix_socket_dir().is_some() {
+      return start_proxy_listener_unix(config, cache_mgr);
+   }
+
+   let listener = TcpListener::bind(&config.listen_addr)?;
+   let listen_addr = config.listen_addr.clone();
+   let shared = shared_state(&config, &cache_mgr);
+   spawn_janitor(&config, &shared.pool, &cache_mgr);
+
+   let config_c = config.clone();
+   let mgr_c = Arc::clone(&cache_mgr);
+   let pool_c = Arc::clone(&shared.pool);
+   let bus_c = shared.bus.clone();
 
    thread::Builder::new()
       .name("fyrodb-dbproxy".into())
@@ -95,25 +164,13 @@ pub fn start_proxy_listener(
       .spawn(move || {
          for stream in listener.incoming() {
             match stream {
-               Ok(client) => {
-                  let cfg = config.clone();
-                  let mgr = Arc::clone(&cache_mgr);
-                  let pool = Arc::clone(&pool);
-                  let bus = bus.clone();
-                  if let Err(e) = thread::Builder::new()
-                     .name("fyrodb-dbconn".into())
-                     .stack_size(session::CLIENT_STACK)
-                     .spawn(move || {
-                        if let Err(e) = session::handle_client(client, cfg, mgr, pool, bus)
-                           && e.kind() != io::ErrorKind::UnexpectedEof
-                        {
-                           eprintln!("fyrodb-dbproxy client error: {e}");
-                        }
-                     })
-                  {
-                     eprintln!("fyrodb-dbproxy: spawn failed: {e}");
-                  }
-               }
+               Ok(client) => spawn_client(
+                  ClientStream::Tcp(client),
+                  config_c.clone(),
+                  Arc::clone(&mgr_c),
+                  Arc::clone(&pool_c),
+                  bus_c.clone(),
+               ),
                Err(e) => {
                   eprintln!("fyrodb-dbproxy accept error on {listen_addr}: {e}");
                }
@@ -122,15 +179,71 @@ pub fn start_proxy_listener(
       })
 }
 
+#[cfg(all(unix, feature = "unix-sockets"))]
+fn start_proxy_listener_unix(
+   config: DbCacheConfig,
+   cache_mgr: Arc<DbCacheManager>,
+) -> io::Result<thread::JoinHandle<()>> {
+   let sock_path = config
+      .unix_socket_file()
+      .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid unix listen address"))?;
+   prepare_unix_socket(&sock_path)?;
+   let listener = std::os::unix::net::UnixListener::bind(&sock_path)?;
+
+   let shared = shared_state(&config, &cache_mgr);
+   spawn_janitor(&config, &shared.pool, &cache_mgr);
+
+   let config_c = config.clone();
+   let mgr_c = Arc::clone(&cache_mgr);
+   let pool_c = Arc::clone(&shared.pool);
+   let bus_c = shared.bus.clone();
+
+   thread::Builder::new()
+      .name("fyrodb-dbproxy-unix".into())
+      .stack_size(256 * 1024)
+      .spawn(move || {
+         for stream in listener.incoming() {
+            match stream {
+               Ok(client) => spawn_client(
+                  ClientStream::Unix(client),
+                  config_c.clone(),
+                  Arc::clone(&mgr_c),
+                  Arc::clone(&pool_c),
+                  bus_c.clone(),
+               ),
+               Err(e) => {
+                  eprintln!("fyrodb-dbproxy unix accept error on {sock_path}: {e}");
+               }
+            }
+         }
+      })
+}
+
+#[cfg(not(all(unix, feature = "unix-sockets")))]
+fn start_proxy_listener_unix(
+   _config: DbCacheConfig,
+   _cache_mgr: Arc<DbCacheManager>,
+) -> io::Result<thread::JoinHandle<()>> {
+   Err(io::Error::new(
+      io::ErrorKind::Unsupported,
+      "unix socket listen addresses require a unix platform and the 'unix-sockets' feature",
+   ))
+}
+
 // Spawns N mio worker threads, each owning a SO_REUSEPORT listener on the
-// same address. FyroDB's event loop is completely unaffected.
+// same address. FyroDB's event loop is completely unaffected. Unix socket
+// addresses bind <dir>/.s.PGSQL.<listen_port> on a single worker — unix
+// sockets cannot share a path via SO_REUSEPORT.
 pub fn start_proxy_listener_mio(
    config: DbCacheConfig,
    cache_mgr: Arc<DbCacheManager>,
 ) -> io::Result<Vec<thread::JoinHandle<()>>> {
-   use socket2::{Domain, Protocol, Socket, Type};
+   use mio_worker::{bind_tcp_listener, bind_unix_listener};
 
-   let n_workers = if config.proxy_workers == 0 {
+   let unix = config.unix_socket_file();
+   let n_workers = if unix.is_some() {
+      1
+   } else if config.proxy_workers == 0 {
       std::thread::available_parallelism()
          .map(|n| n.get())
          .unwrap_or(4)
@@ -139,64 +252,33 @@ pub fn start_proxy_listener_mio(
       config.proxy_workers
    };
 
-   let addr: std::net::SocketAddr = config.listen_addr.parse().map_err(|e| {
-      io::Error::new(
-         io::ErrorKind::InvalidInput,
-         format!("invalid listen addr: {e}"),
-      )
-   })?;
-
-   let pool = Arc::new(UpstreamPool::new(PoolLimits {
-      max_idle: config.pool_max_idle,
-      idle_timeout: Duration::from_millis(config.pool_idle_timeout_ms),
-   }));
-
-   let bus: Option<Arc<InvalidationBus>> = if config.mode == DbProxyMode::Dual {
-      match config.bus_path.as_deref() {
-         Some(path) => {
-            match crate::bus::start(path, Arc::clone(&cache_mgr), config.key_prefix.clone()) {
-               Ok(b) => Some(b),
-               Err(e) => {
-                  eprintln!("fyrodb-dbproxy-mio: invalidation bus unavailable ({path}): {e}");
-                  None
-               }
-            }
-         }
-         None => None,
-      }
+   let mut listeners = Vec::with_capacity(n_workers);
+   if let Some(sock_path) = unix {
+      listeners.push(bind_unix_listener(&sock_path)?);
    } else {
-      None
-   };
+      let addr: std::net::SocketAddr = config.listen_addr.parse().map_err(|e| {
+         io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid listen addr: {e}"),
+         )
+      })?;
+      for _ in 0..n_workers {
+         listeners.push(bind_tcp_listener(addr)?);
+      }
+   }
+
+   let shared = shared_state(&config, &cache_mgr);
 
    // Shared blocking sub-pool for connections that need upstream access.
    let blocking_threads = n_workers.max(2);
    let blocking_pool = mio_worker::BlockingPool::start(blocking_threads);
 
    let mut handles = Vec::with_capacity(n_workers);
-   for i in 0..n_workers {
-      let sock = Socket::new(
-         if addr.is_ipv6() {
-            Domain::IPV6
-         } else {
-            Domain::IPV4
-         },
-         Type::STREAM,
-         Some(Protocol::TCP),
-      )?;
-      sock.set_reuse_address(true)?;
-      #[cfg(unix)]
-      sock.set_reuse_port(true)?;
-      sock.set_nonblocking(true)?;
-      sock.bind(&addr.into())?;
-      sock.listen(1024)?;
-
-      let std_listener: TcpListener = sock.into();
-      let mio_listener = mio::net::TcpListener::from_std(std_listener);
-
+   for (i, listener) in listeners.into_iter().enumerate() {
       let cfg = Arc::new(config.clone());
       let mgr = Arc::clone(&cache_mgr);
-      let pool_c = Arc::clone(&pool);
-      let bus_c = bus.clone();
+      let pool_c = Arc::clone(&shared.pool);
+      let bus_c = shared.bus.clone();
       let bp = Arc::clone(&blocking_pool);
       let (dtx, drx) = mpsc::sync_channel::<usize>(blocking_threads * 16);
 
@@ -204,7 +286,7 @@ pub fn start_proxy_listener_mio(
          .name(format!("fyrodb-mio-proxy-{i}"))
          .stack_size(256 * 1024)
          .spawn(move || {
-            mio_worker::run_proxy_worker(mio_listener, mgr, cfg, pool_c, bus_c, bp, drx, dtx);
+            mio_worker::run_proxy_worker(listener, mgr, cfg, pool_c, bus_c, bp, drx, dtx);
          })?;
       handles.push(handle);
    }

@@ -202,10 +202,17 @@ fn main() {
       if let Err(e) = fyro_dbcache::start_proxy_listener(config.dbcache.clone(), cache_mgr) {
          eprintln!("fyrodb: failed to start dbcache proxy: {e}");
       } else {
-         println!(
-            "  dbcache=enabled listen={} mode={:?}",
-            config.dbcache.listen_addr, config.dbcache.mode
-         );
+         if let Some(sock) = config.dbcache.unix_socket_file() {
+            println!(
+               "  dbcache=enabled listen={} socket={} mode={:?}",
+               config.dbcache.listen_addr, sock, config.dbcache.mode
+            );
+         } else {
+            println!(
+               "  dbcache=enabled listen={} mode={:?}",
+               config.dbcache.listen_addr, config.dbcache.mode
+            );
+         }
          println!("  dbcache proxy_url={}", config.dbcache.client_url());
          println!(
             "  dbcache default_ttl={}s pool_idle_max={} pool_idle={}ms auth_users={} bus={}",
@@ -354,9 +361,18 @@ impl Config {
             "--db-port" if i + 1 < args.len() => {
                dbcache.enabled = true;
                if let Ok(p) = args[i + 1].parse::<u16>() {
-                  let bind = env::var("FYRODB_DB_BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
-                  dbcache.listen_addr = format!("{bind}:{p}");
+                  dbcache.listen_port = p;
+                  if dbcache.unix_socket_dir().is_none() {
+                     let bind =
+                        env::var("FYRODB_DB_BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
+                     dbcache.listen_addr = format!("{bind}:{p}");
+                  }
                }
+               i += 1;
+            }
+            "--db-unix-socket" if i + 1 < args.len() => {
+               dbcache.enabled = true;
+               dbcache.listen_addr = format!("unix:{}", args[i + 1]);
                i += 1;
             }
             "--db-ttl" | "--db-cache-ttl" if i + 1 < args.len() => {

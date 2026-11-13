@@ -1,0 +1,14 @@
+[package]
+name = "fyro-net"
+version = "0.3.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Shared TCP/Unix-domain-socket stream and listener types for FyroDB"
+
+[features]
+# Enables the Unix(UnixListener)/Unix(UnixStream) variants. Only meaningful on
+# unix platforms, where mio provides the underlying types.
+unix-sockets = []
+
+[dependencies]
+mio = { version = "1.2", features = ["net", "os-poll"] }

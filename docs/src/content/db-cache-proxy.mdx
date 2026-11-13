@@ -218,6 +218,38 @@ The minimal set of variables for a production proxy-only deployment:
 | `FYRODB_PROXY_BLOCKING_POOL` | `16` | upstream / miss thread pool |
 | `FYRODB_PROXY_MODE` | `dual` or `cache-only` | fallback behaviour on miss |
 
+## Unix Domain Sockets
+
+> **Note:** Unix socket support is gated behind the `unix-sockets` cargo feature (`--features unix-sockets`), on both the `fyro_db` binary and the `fyro-dbcache` crate. Prebuilt images include it.
+
+On Unix platforms the proxy can listen on a Unix domain socket instead of TCP — useful when the proxy and the application share a host or container. Set `FYRODB_DB_UNIX_SOCKET` to a **directory**; the proxy binds `<dir>/.s.PGSQL.<FYRODB_DB_PORT>` inside it, exactly like a real PostgreSQL server, so every standard driver works unchanged:
+
+```bash
+docker run -d \
+  -v /run/fyrodb:/run/fyrodb \
+  -e FYRODB_DB_UNIX_SOCKET=/run/fyrodb \
+  -e FYRODB_DB_PORT=5433 \
+  rana718/fyrodb:latest
+```
+
+Clients connect with the usual libpq convention — `host` is the socket directory:
+
+```bash
+psql "host=/run/fyrodb port=5433 dbname=mydb"
+# or in a connection URI: postgresql://user@%2Frun%2Ffyrodb:5433/mydb
+```
+
+When `FYRODB_DB_UNIX_SOCKET` is set it takes precedence over `FYRODB_DB_BIND`/`FYRODB_DB_PORT` for the listen address (the port still selects the `.s.PGSQL.<port>` filename). TCP and unix listening are mutually exclusive — pick one.
+
+The **upstream** connection can also use a Unix socket: put the percent-encoded socket directory in the host position of `FYRODB_DB_UPSTREAM`, the same form libpq accepts:
+
+```bash
+FYRODB_DB_UPSTREAM="postgresql://user:pass@%2Fvar%2Frun%2Fpostgresql/mydb"
+# connects to /var/run/postgresql/.s.PGSQL.5432
+```
+
+SSL is never negotiated over Unix sockets, so `sslmode` is ignored for unix upstreams.
+
 ## Per-Session Context Fingerprinting
 
 Session-level settings — `search_path`, `timezone`, `datestyle`, `client_encoding`, and others — are probed on connection and mixed into every cache key for that session. A query under `search_path = myschema` and the same query under `search_path = public` produce different fingerprints and are cached separately. Changing `SET search_path` mid-session is handled correctly — the fingerprint updates and the next query is treated as a miss against the new context.

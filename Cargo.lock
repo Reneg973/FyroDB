@@ -348,6 +348,7 @@ version = "0.3.1"
 dependencies = [
  "base64",
  "foldhash",
+ "fyro-net",
  "getrandom 0.4.3",
  "md-5",
  "mio",
@@ -358,6 +359,13 @@ dependencies = [
  "sha2",
  "socket2",
  "sqlparser",
+]
+
+[[package]]
+name = "fyro-net"
+version = "0.3.1"
+dependencies = [
+ "mio",
 ]
 
 [[package]]
@@ -381,6 +389,7 @@ dependencies = [
  "customhash",
  "foldhash",
  "fyro-dbcache",
+ "fyro-net",
  "fyro-vector",
  "io-uring",
  "libc",

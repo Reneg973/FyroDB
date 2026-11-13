@@ -9,7 +9,14 @@ description = "FyroDB database caching proxy engine with cross-protocol storage 
 name = "fyro_dbcache"
 path = "src/lib.rs"
 
+[features]
+# Enables Unix domain socket support for the proxy: clients may connect via
+# <dir>/.s.PGSQL.<port> and upstream targets may use host=/dir or a
+# percent-encoded URI host. Only meaningful on unix platforms.
+unix-sockets = ["fyro-net/unix-sockets"]
+
 [dependencies]
+fyro-net = { path = "../fyro-net" }
 base64 = "0.23"
 foldhash = "0.2.0"
 getrandom = "0.4"

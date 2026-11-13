@@ -1,3 +1,4 @@
+use super::stream::ClientStream;
 use crate::auth::{self, ClientAuthError};
 use crate::bus::InvalidationBus;
 use crate::cache::{DbCacheManager, EncodedResult, mix64};
@@ -10,7 +11,6 @@ use crate::upstream::{HandshakeError, RelayOutcome, ReplyStop, UpstreamConnectio
 use foldhash::fast::FixedState;
 use std::collections::HashMap;
 use std::io::{self, BufReader, Write};
-use std::net::TcpStream;
 use std::sync::Arc;
 
 pub(super) const CLIENT_STACK: usize = 512 * 1024;
@@ -29,7 +29,7 @@ enum ContextState {
 
 struct ClientSink<'a> {
    out: &'a mut Vec<u8>,
-   client: &'a mut TcpStream,
+   client: &'a mut ClientStream,
 }
 
 impl Write for ClientSink<'_> {
@@ -50,13 +50,13 @@ impl Write for ClientSink<'_> {
 }
 
 pub(super) fn handle_client(
-   client: TcpStream,
+   client: ClientStream,
    config: DbCacheConfig,
    cache_mgr: Arc<DbCacheManager>,
    pool: Arc<UpstreamPool>,
    bus: Option<Arc<InvalidationBus>>,
 ) -> io::Result<()> {
-   client.set_nodelay(true)?;
+   client.set_nodelay()?;
    let read_stream = client.try_clone()?;
    let mut session = Session {
       client,
@@ -107,8 +107,8 @@ struct PortalState {
 }
 
 struct Session {
-   client: TcpStream,
-   reader: FrameReader<BufReader<TcpStream>>,
+   client: ClientStream,
+   reader: FrameReader<BufReader<ClientStream>>,
    config: DbCacheConfig,
    mgr: Arc<DbCacheManager>,
    pool: Arc<UpstreamPool>,

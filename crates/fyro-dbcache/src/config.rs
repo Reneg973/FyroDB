@@ -105,6 +105,16 @@ pub struct UpstreamTarget {
 }
 
 impl UpstreamTarget {
+   // True when the host is a Unix socket directory (libpq-style host=/dir or
+   // a percent-encoded URI host beginning with '/').
+   pub fn is_unix(&self) -> bool {
+      self.host.starts_with('/')
+   }
+
+   // Socket file the proxy connects to: <dir>/.s.PGSQL.<port>.
+   pub fn socket_path(&self) -> String {
+      format!("{}/.s.PGSQL.{}", self.host.trim_end_matches('/'), self.port)
+   }
    pub fn parse(input: &str) -> Self {
       let mut s = input.trim();
       let has_scheme = if let Some(stripped) = s.strip_prefix("postgresql://") {
@@ -176,14 +186,14 @@ impl UpstreamTarget {
          (h.to_string(), p)
       } else if let Some((h, p)) = host_port.split_once(':') {
          let p = p.parse::<u16>().unwrap_or(5432);
-         (h.to_string(), p)
+         (percent_decode(h), p)
       } else {
          let h = if host_port.is_empty() {
             "127.0.0.1"
          } else {
             host_port
          };
-         (h.to_string(), 5432)
+         (percent_decode(h), 5432)
       };
 
       Self {
@@ -220,12 +230,28 @@ fn percent_decode(s: &str) -> String {
    String::from_utf8_lossy(&bytes).into_owned()
 }
 
+// Percent-encodes everything outside the RFC 3986 unreserved set, producing
+// the host form libpq expects for Unix socket directories in connection URIs.
+fn percent_encode(s: &str) -> String {
+   let mut out = String::with_capacity(s.len());
+   for &b in s.as_bytes() {
+      match b {
+         b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+         _ => out.push_str(&format!("%{b:02X}")),
+      }
+   }
+   out
+}
+
 #[derive(Debug, Clone)]
 pub struct DbCacheConfig {
    pub enabled: bool,
    pub mode: DbProxyMode,
    pub upstream_addr: Option<String>,
+   // "host:port" for TCP, or "unix:<dir>" for a Unix socket listen address.
+   // In unix mode the proxy binds <dir>/.s.PGSQL.<listen_port>.
    pub listen_addr: String,
+   pub listen_port: u16,
    pub default_ttl_ms: u64,
    pub key_prefix: String,
    // Drops persisted query results on startup. Keeping them is opt-in because
@@ -261,6 +287,7 @@ impl Default for DbCacheConfig {
          mode: DbProxyMode::Dual,
          upstream_addr: None,
          listen_addr: "0.0.0.0:5433".to_string(),
+         listen_port: 5433,
          default_ttl_ms: 60_000,
          key_prefix: "db:".to_string(),
          flush_on_start: true,
@@ -278,24 +305,53 @@ impl Default for DbCacheConfig {
 }
 
 impl DbCacheConfig {
+   // Unix socket directory when listen_addr uses the "unix:" form.
+   pub fn unix_socket_dir(&self) -> Option<&str> {
+      let path = self
+         .listen_addr
+         .strip_prefix("unix://")
+         .or_else(|| self.listen_addr.strip_prefix("unix:"))?;
+      if path.is_empty() { None } else { Some(path) }
+   }
+
+   // Socket file the listener binds: <dir>/.s.PGSQL.<listen_port>.
+   pub fn unix_socket_file(&self) -> Option<String> {
+      self.unix_socket_dir().map(|dir| {
+         format!(
+            "{}/.s.PGSQL.{}",
+            dir.trim_end_matches('/'),
+            self.listen_port
+         )
+      })
+   }
+
    /// Returns a client-ready connection URL for this proxy instance.
    pub fn client_url(&self) -> String {
-      let port = self
-         .listen_addr
-         .rsplit_once(':')
-         .map(|(_, p)| p)
-         .unwrap_or("5433");
-      if let Some(upstream) = &self.upstream_addr {
-         let target = UpstreamTarget::parse(upstream);
-         let user = target.user.as_deref().unwrap_or("postgres");
-         let db = target.database.as_deref().unwrap_or("postgres");
-         if let Some(pass) = &target.password {
-            format!("postgres://{user}:{pass}@127.0.0.1:{port}/{db}?sslmode=disable")
-         } else {
-            format!("postgres://{user}@127.0.0.1:{port}/{db}?sslmode=disable")
-         }
+      let target = self.upstream_addr.as_deref().map(UpstreamTarget::parse);
+      let user = target
+         .as_ref()
+         .and_then(|t| t.user.as_deref())
+         .unwrap_or("postgres");
+      let db = target
+         .as_ref()
+         .and_then(|t| t.database.as_deref())
+         .unwrap_or("postgres");
+      let auth = target
+         .as_ref()
+         .and_then(|t| t.password.as_deref())
+         .map(|pass| format!("{user}:{pass}"))
+         .unwrap_or_else(|| user.to_string());
+      if let Some(dir) = self.unix_socket_dir() {
+         let encoded = percent_encode(dir.trim_end_matches('/'));
+         let port = self.listen_port;
+         format!("postgres://{auth}@{encoded}:{port}/{db}?sslmode=disable")
       } else {
-         format!("postgres://postgres@127.0.0.1:{port}/postgres?sslmode=disable")
+         let port = self
+            .listen_addr
+            .rsplit_once(':')
+            .map(|(_, p)| p)
+            .unwrap_or("5433");
+         format!("postgres://{auth}@127.0.0.1:{port}/{db}?sslmode=disable")
       }
    }
 
@@ -320,6 +376,16 @@ impl DbCacheConfig {
          .unwrap_or(5433);
 
       let bind = env::var("FYRODB_DB_BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
+      let unix_socket = env::var("FYRODB_DB_UNIX_SOCKET")
+         .ok()
+         .filter(|s| !s.is_empty());
+      let listen_addr = if let Some(dir) = unix_socket {
+         format!("unix:{dir}")
+      } else if bind.starts_with("unix:") || bind.starts_with("unix://") {
+         bind.clone()
+      } else {
+         format!("{bind}:{port}")
+      };
       let ttl = env::var("FYRODB_DB_TTL_MS")
          .ok()
          .and_then(|t| t.parse::<u64>().ok())
@@ -384,7 +450,8 @@ impl DbCacheConfig {
          enabled,
          mode,
          upstream_addr: upstream,
-         listen_addr: format!("{bind}:{port}"),
+         listen_addr,
+         listen_port: port,
          default_ttl_ms: ttl,
          key_prefix: "db:".to_string(),
          flush_on_start: !keep_cache,
@@ -439,6 +506,47 @@ mod tests {
       assert_eq!(
          target.addr(),
          "ep-solitary-water-b4uu6e7t.c-6.us-east-2.aws.neon.tech:5432"
+      );
+   }
+
+   #[test]
+   fn test_upstream_target_parsing_unix_socket() {
+      let uri = UpstreamTarget::parse("postgresql://%2Fvar%2Frun%2Fpostgresql/mydb");
+      assert_eq!(uri.host, "/var/run/postgresql");
+      assert_eq!(uri.port, 5432);
+      assert_eq!(uri.database.as_deref(), Some("mydb"));
+      assert!(uri.is_unix());
+      assert_eq!(uri.socket_path(), "/var/run/postgresql/.s.PGSQL.5432");
+
+      let with_port = UpstreamTarget::parse("postgres://user:pass@%2Ftmp%2Fpg:5433/db");
+      assert_eq!(with_port.host, "/tmp/pg");
+      assert_eq!(with_port.port, 5433);
+      assert_eq!(with_port.user.as_deref(), Some("user"));
+      assert_eq!(with_port.password.as_deref(), Some("pass"));
+      assert_eq!(with_port.database.as_deref(), Some("db"));
+      assert!(with_port.is_unix());
+      assert_eq!(with_port.socket_path(), "/tmp/pg/.s.PGSQL.5433");
+
+      let tcp = UpstreamTarget::parse("127.0.0.1:5432");
+      assert!(!tcp.is_unix());
+   }
+
+   #[test]
+   fn test_unix_listen_helpers() {
+      let mut config = DbCacheConfig::default();
+      assert!(config.unix_socket_dir().is_none());
+      assert!(config.unix_socket_file().is_none());
+
+      config.listen_addr = "unix:/run/fyrodb".to_string();
+      config.listen_port = 5433;
+      assert_eq!(config.unix_socket_dir(), Some("/run/fyrodb"));
+      assert_eq!(
+         config.unix_socket_file().as_deref(),
+         Some("/run/fyrodb/.s.PGSQL.5433")
+      );
+      assert_eq!(
+         config.client_url(),
+         "postgres://postgres@%2Frun%2Ffyrodb:5433/postgres?sslmode=disable"
       );
    }
 
