@@ -184,17 +184,7 @@ impl RespParser {
       }
    }
 
-   pub fn read_buf(&mut self) -> &mut [u8] {
-      self.make_room();
-      if self.rbuf.len() - self.filled < 16 * 1024 {
-         let grown = (self.rbuf.len() * 2).max(Self::IDLE_READ_BUFFER);
-         self.rbuf.resize(grown, 0);
-      }
-      &mut self.rbuf[self.filled..]
-   }
-
-   /// Make room for another read, compacting consumed bytes first. Growth is
-   /// left to `reserve` so the hot path never memsets the new region.
+   /// Make room for another read, compacting consumed bytes first.
    #[inline]
    fn make_room(&mut self) {
       if self.pos == self.filled && self.partial.is_none() {
@@ -209,7 +199,6 @@ impl RespParser {
       }
       let frame_fits = self.min_needed > self.filled && self.min_needed <= self.rbuf.capacity();
       if self.rbuf.capacity() - self.filled < 16 * 1024 && !frame_fits {
-         self.rbuf.truncate(self.filled);
          let target = self.min_needed.min(Self::MAX_REUSED_READ_BUFFER);
          let grow = if self.filled >= Self::IDLE_READ_BUFFER {
             target
@@ -218,26 +207,49 @@ impl RespParser {
          } else {
             Self::IDLE_READ_BUFFER
          };
-         self.rbuf.reserve(grow);
+         let target_len = self
+            .filled
+            .checked_add(grow)
+            .expect("read buffer capacity overflow");
+         self
+            .rbuf
+            .reserve(target_len.saturating_sub(self.rbuf.len()));
       }
    }
 
-   /// Spare capacity for socket read, published via `did_fill`.
+   /// Let `fill` write into initialized spare buffer space, then publish the
+   /// number of bytes it reports.
+   ///
+   /// The closure must report the number of bytes it actually filled. Any
+   /// bytes it does not write remain initialized, but reporting them as filled
+   /// may cause the parser to interpret their existing contents as input.
    #[inline]
-   pub fn read_spare(&mut self) -> (*mut u8, usize) {
+   pub fn fill_with<E>(
+      &mut self,
+      fill: impl FnOnce(&mut [u8]) -> Result<usize, E>,
+   ) -> Result<usize, E> {
       self.make_room();
-      let spare = self.rbuf.capacity() - self.filled;
-      (unsafe { self.rbuf.as_mut_ptr().add(self.filled) }, spare)
+      let capacity = self.rbuf.capacity();
+      if self.rbuf.len() < capacity {
+         self.rbuf.resize(capacity, 0);
+      }
+      let n = fill(&mut self.rbuf[self.filled..])?;
+      let filled = self.checked_filled_len(n);
+      self.filled = filled;
+      Ok(n)
    }
 
    #[inline]
-   pub fn did_fill(&mut self, n: usize) {
-      self.filled += n;
-      if self.filled > self.rbuf.len() {
-         // SAFETY: the read path writes into spare capacity before calling
-         // this, so every byte below `filled` is initialised.
-         unsafe { self.rbuf.set_len(self.filled) };
-      }
+   fn checked_filled_len(&self, n: usize) -> usize {
+      let filled = self
+         .filled
+         .checked_add(n)
+         .expect("read buffer length overflow");
+      assert!(
+         filled <= self.rbuf.capacity(),
+         "initialized bytes exceed read buffer capacity"
+      );
+      filled
    }
 
    #[inline]
@@ -520,6 +532,9 @@ impl RespParser {
          return None;
       }
       let post_k = exp_kstart + key_len;
+      if avail - set_len < post_k.checked_add(2)? {
+         return None;
+      }
       if unsafe { std::ptr::read_unaligned(exp_buf.add(post_k) as *const u16) } != CRLF {
          return None;
       }
@@ -1290,6 +1305,7 @@ impl RespParser {
       let cmd_ptr = unsafe { buf.add(8) };
 
       let p2 = unsafe { buf.add(c1_total) };
+      let p2_avail = avail - c1_total;
       if unsafe { *p2 } != b'$' {
          return None;
       }
@@ -1301,7 +1317,8 @@ impl RespParser {
          ((k1 - b'0') as usize, 2)
       } else {
          let k2 = unsafe { *p2.add(2) };
-         if k2.is_ascii_digit()
+         if p2_avail >= 5
+            && k2.is_ascii_digit()
             && unsafe { std::ptr::read_unaligned(p2.add(3) as *const u16) } == CRLF
          {
             (((k1 - b'0') as usize) * 10 + (k2 - b'0') as usize, 3)
@@ -1808,14 +1825,20 @@ fn parse_usize(s: &[u8], max: usize) -> Option<usize> {
 mod tests {
    use super::{ParseResult, RespParser, parse_len_le4};
 
+   fn feed_chunk(parser: &mut RespParser, bytes: &[u8], max: usize) -> usize {
+      parser
+         .fill_with(|spare| {
+            let n = spare.len().min(bytes.len()).min(max);
+            spare[..n].copy_from_slice(&bytes[..n]);
+            Ok::<_, std::convert::Infallible>(n)
+         })
+         .unwrap()
+   }
+
    fn feed(parser: &mut RespParser, bytes: &[u8]) {
       let mut offset = 0;
       while offset < bytes.len() {
-         let buf = parser.read_buf();
-         let n = buf.len().min(bytes.len() - offset);
-         buf[..n].copy_from_slice(&bytes[offset..offset + n]);
-         parser.did_fill(n);
-         offset += n;
+         offset += feed_chunk(parser, &bytes[offset..], usize::MAX);
       }
    }
 
@@ -1899,11 +1922,16 @@ mod tests {
    #[test]
    fn the_first_read_establishes_the_idle_buffer_size() {
       let mut parser = RespParser::new();
-      let buf = parser.read_buf();
+      let mut spare = 0;
+      parser
+         .fill_with(|buf| {
+            spare = buf.len();
+            Ok::<_, std::convert::Infallible>(0)
+         })
+         .unwrap();
       assert!(
-         buf.len() >= 1024,
-         "first read_buf handed back only {} bytes",
-         buf.len()
+         spare >= 1024,
+         "first read had only {spare} bytes of spare capacity"
       );
       assert_eq!(parser.rbuf.capacity(), RespParser::IDLE_READ_BUFFER);
    }
@@ -1917,7 +1945,9 @@ mod tests {
       assert!(matches!(parser.parse_one(), ParseResult::Complete));
       assert!(matches!(parser.parse_one(), ParseResult::Incomplete));
 
-      parser.read_spare();
+      parser
+         .fill_with(|_| Ok::<_, std::convert::Infallible>(0))
+         .unwrap();
       assert_eq!(parser.pos, 0);
       assert_eq!(parser.min_needed, header.len() + 524_288 + 2);
       assert_eq!(parser.rbuf.capacity(), RespParser::IDLE_READ_BUFFER);
@@ -1962,7 +1992,7 @@ mod tests {
    }
 
    /// Resumes multi-read commands from saved element index even when
-   /// read_buf compacts or reallocates.
+   /// read_spare compacts or reallocates.
    #[test]
    fn a_fragmented_large_command_resumes_across_reads() {
       let (mut wire, args) = big_hset(3000);
@@ -1974,11 +2004,7 @@ mod tests {
          if offset >= wire.len() {
             break;
          }
-         let buf = parser.read_buf();
-         let n = (*chunk).min(buf.len()).min(wire.len() - offset);
-         buf[..n].copy_from_slice(&wire[offset..offset + n]);
-         parser.did_fill(n);
-         offset += n;
+         offset += feed_chunk(&mut parser, &wire[offset..], *chunk);
          if !done {
             match parser.parse_one() {
                ParseResult::Complete => {
@@ -2069,6 +2095,105 @@ mod tests {
          parts_of(&parser),
          vec!["HSET", key.as_str(), field.as_str(), value.as_str()]
       );
+   }
+
+   #[test]
+   fn fast_expire_path_rejects_truncated_key_terminator() {
+      let mut input = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n".to_vec();
+      let set_len = input.len();
+      input.extend_from_slice(b"*3\r\n$6\r\nEXPIRE\r\n$00000001\r\nk\r\n$1\r\n1\r\n");
+      let avail = set_len + 16 + 4 + 1 + 2 + 5;
+      let mut parser = RespParser::new();
+
+      assert!(
+         parser
+            .try_fast_set_expire_pair_at(input.as_ptr(), avail)
+            .is_none()
+      );
+   }
+
+   #[test]
+   fn fast_two_digit_header_rejects_truncated_crlf() {
+      let input = b"*2\r\n$2\r\nOK\r\n$12\r\n";
+      let mut parser = RespParser::new();
+
+      assert!(parser.try_fast_parse_2_at(input.as_ptr(), 16).is_none());
+   }
+
+   #[test]
+   #[should_panic(expected = "initialized bytes exceed read buffer capacity")]
+   fn fill_with_rejects_counts_beyond_spare_capacity() {
+      let mut parser = RespParser::new();
+      parser
+         .fill_with(|spare| Ok::<_, std::convert::Infallible>(spare.len() + 1))
+         .unwrap();
+   }
+
+   #[test]
+   fn fill_with_commits_partial_and_zero_byte_fills() {
+      let mut parser = RespParser::new();
+      assert_eq!(
+         parser
+            .fill_with(|spare| {
+               spare[..3].copy_from_slice(b"abc");
+               Ok::<_, std::convert::Infallible>(3)
+            })
+            .unwrap(),
+         3
+      );
+      assert_eq!(parser.filled, 3);
+      assert_eq!(&parser.rbuf[..3], b"abc");
+
+      assert_eq!(
+         parser
+            .fill_with(|_| Ok::<_, std::convert::Infallible>(0))
+            .unwrap(),
+         0
+      );
+      assert_eq!(parser.filled, 3);
+   }
+
+   #[test]
+   fn fill_with_does_not_commit_on_error() {
+      let mut parser = RespParser::new();
+      feed_chunk(&mut parser, b"prefix", usize::MAX);
+
+      let result = parser.fill_with(|spare| {
+         spare[..4].copy_from_slice(b"more");
+         Err::<usize, _>("read failed")
+      });
+
+      assert_eq!(result, Err("read failed"));
+      assert_eq!(parser.filled, 6);
+      assert_eq!(&parser.rbuf[..6], b"prefix");
+   }
+
+   #[test]
+   fn fill_with_does_not_commit_on_panic() {
+      let mut parser = RespParser::new();
+      feed_chunk(&mut parser, b"prefix", usize::MAX);
+
+      let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+         let _: Result<usize, std::convert::Infallible> = parser.fill_with(|spare| {
+            spare[..4].copy_from_slice(b"more");
+            panic!("fill failed");
+         });
+      }));
+
+      assert!(result.is_err());
+      assert_eq!(parser.filled, 6);
+      assert_eq!(&parser.rbuf[..6], b"prefix");
+   }
+
+   #[test]
+   fn fill_with_publishes_only_initialized_bytes_even_if_count_is_wrong() {
+      let mut parser = RespParser::new();
+      parser
+         .fill_with(|_| Ok::<_, std::convert::Infallible>(2))
+         .unwrap();
+
+      assert_eq!(parser.filled, 2);
+      assert_eq!(&parser.rbuf[..2], &[0, 0]);
    }
 
    #[test]

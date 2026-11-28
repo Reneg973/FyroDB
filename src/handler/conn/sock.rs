@@ -1,25 +1,11 @@
 use super::*;
+use std::io::Read;
 
 impl<'a> Conn<'a> {
    /// Dispatch buffered pipelines at this size. Incomplete frames can grow past it.
    const MAX_READ_AHEAD: usize = 128 * 1024;
    /// Dispatches per hold of the shared command guard.
    const GUARD_DISPATCHES: u32 = 64;
-
-   #[inline]
-   fn recv_raw(&self, ptr: *mut u8, len: usize) -> io::Result<usize> {
-      use std::os::fd::AsRawFd;
-      loop {
-         let n = unsafe { libc::recv(self.stream.as_raw_fd(), ptr.cast(), len, 0) };
-         if n >= 0 {
-            return Ok(n as usize);
-         }
-         let err = io::Error::last_os_error();
-         if err.kind() != io::ErrorKind::Interrupted {
-            return Err(err);
-         }
-      }
-   }
 
    pub fn do_read(&mut self) -> bool {
       self.do_read_with::<false>()
@@ -32,15 +18,18 @@ impl<'a> Conn<'a> {
       let raw_only = false;
 
       loop {
-         let (ptr, cap) = self.parser.read_spare();
-         let n = match self.recv_raw(ptr, cap) {
+         let stream = &mut self.stream;
+         let mut cap = 0;
+         let n = match self.parser.fill_with(|spare| {
+            cap = spare.len();
+            stream.read(spare)
+         }) {
             Ok(0) => return false,
             Ok(n) => n,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(_) => return false,
          };
-         self.parser.did_fill(n);
          if !raw_only
             && self.parser.pending() >= Self::MAX_READ_AHEAD
             && self.parser.filled >= self.parser.min_needed
@@ -476,7 +465,7 @@ mod tests {
       assert_eq!(out, expected);
       for key in &keys {
          let value = store.data.get_ref_bytes(key).expect("key stored");
-         assert!(value.expires_ms != 0, "TTL applied");
+         assert_ne!(value.expires_ms, 0, "TTL applied");
       }
    }
 

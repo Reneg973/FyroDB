@@ -9,6 +9,17 @@ use fyro_db::utils::parser::{ParseResult, RespParser};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
+#[inline]
+fn copy_to_spare(parser: &mut RespParser, bytes: &[u8]) -> usize {
+   parser
+      .fill_with(|spare| {
+         let n = spare.len().min(bytes.len());
+         spare[..n].copy_from_slice(&bytes[..n]);
+         Ok::<_, std::convert::Infallible>(n)
+      })
+      .unwrap()
+}
+
 fn lcg(seed: &mut u64) -> f32 {
    *seed = seed
       .wrapping_mul(6364136223846793005)
@@ -70,12 +81,7 @@ fn bench_parser() {
    let mut parsers = Vec::with_capacity(ITERS);
    for _ in 0..ITERS {
       let mut p = RespParser::new();
-      let _ = p.read_buf();
-      while p.rbuf.len() < wire.len() + 1024 {
-         p.rbuf.resize(p.rbuf.len() * 2 + 4096, 0);
-      }
-      p.rbuf[..wire.len()].copy_from_slice(&wire);
-      p.did_fill(wire.len());
+      let _ = copy_to_spare(&mut p, &wire);
       parsers.push(p);
    }
 

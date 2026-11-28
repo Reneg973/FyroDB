@@ -1,6 +1,37 @@
 use fyro_db::utils::parser::{ParseResult, RespParser};
 use std::time::Instant;
 
+fn copy_to_spare(parser: &mut RespParser, bytes: &[u8]) -> usize {
+   parser
+      .fill_with(|spare| {
+         let n = spare.len().min(bytes.len());
+         spare[..n].copy_from_slice(&bytes[..n]);
+         Ok::<_, std::convert::Infallible>(n)
+      })
+      .unwrap()
+}
+
+#[test]
+fn copy_to_spare_handles_chunked_resp_input() {
+   const NUM_COMMANDS: usize = 5_000;
+   let wire = b"*1\r\n$4\r\nPING\r\n".repeat(NUM_COMMANDS);
+   let mut parser = RespParser::new();
+   let mut offset = 0;
+   let mut parsed_count = 0;
+
+   while offset < wire.len() {
+      let n = copy_to_spare(&mut parser, &wire[offset..]);
+      assert!(n > 0);
+      offset += n;
+
+      while let ParseResult::Complete = parser.parse_one() {
+         parsed_count += 1;
+      }
+   }
+
+   assert_eq!(parsed_count, NUM_COMMANDS);
+}
+
 #[test]
 fn bench_pure_resp_parser_throughput() {
    println!("\n==========================================================================");
@@ -26,22 +57,10 @@ fn bench_pure_resp_parser_throughput() {
 
       let mut parser = RespParser::new();
       // Pre-fill the parser buffer with all 10M commands to test raw parsing latency
-      let target = parser.read_buf();
-      // Grow to accommodate
-      let needed = big_buf.len();
-      let current_cap = target.len();
-      if current_cap < needed {
-         // feed in chunks
-      }
-
-      // We can feed all bytes directly
       let mut offset = 0;
       while offset < big_buf.len() {
-         let buf = parser.read_buf();
-         let chunk = buf.len().min(big_buf.len() - offset);
-         buf[..chunk].copy_from_slice(&big_buf[offset..offset + chunk]);
-         parser.did_fill(chunk);
-         offset += chunk;
+         let n = copy_to_spare(&mut parser, &big_buf[offset..]);
+         offset += n;
       }
 
       let start = Instant::now();
@@ -84,10 +103,7 @@ fn bench_pure_resp_parser_throughput() {
       while parsed_count < NUM_COMMANDS {
          let mut offset = 0;
          while offset < batch_buf.len() && parsed_count < NUM_COMMANDS {
-            let buf = parser.read_buf();
-            let n = buf.len().min(batch_buf.len() - offset);
-            buf[..n].copy_from_slice(&batch_buf[offset..offset + n]);
-            parser.did_fill(n);
+            let n = copy_to_spare(&mut parser, &batch_buf[offset..]);
             offset += n;
 
             while let ParseResult::Complete = parser.parse_one() {
@@ -129,10 +145,7 @@ fn bench_pure_resp_parser_throughput() {
       while parsed_count < NUM_COMMANDS {
          let mut offset = 0;
          while offset < batch_buf.len() && parsed_count < NUM_COMMANDS {
-            let buf = parser.read_buf();
-            let n = buf.len().min(batch_buf.len() - offset);
-            buf[..n].copy_from_slice(&batch_buf[offset..offset + n]);
-            parser.did_fill(n);
+            let n = copy_to_spare(&mut parser, &batch_buf[offset..]);
             offset += n;
 
             while let ParseResult::Complete = parser.parse_one() {
@@ -174,10 +187,7 @@ fn bench_pure_resp_parser_throughput() {
       while parsed_count < NUM_COMMANDS {
          let mut offset = 0;
          while offset < batch_buf.len() && parsed_count < NUM_COMMANDS {
-            let buf = parser.read_buf();
-            let n = buf.len().min(batch_buf.len() - offset);
-            buf[..n].copy_from_slice(&batch_buf[offset..offset + n]);
-            parser.did_fill(n);
+            let n = copy_to_spare(&mut parser, &batch_buf[offset..]);
             offset += n;
 
             while let ParseResult::Complete = parser.parse_one() {
@@ -219,10 +229,7 @@ fn bench_pure_resp_parser_throughput() {
       while parsed_count < NUM_COMMANDS {
          let mut offset = 0;
          while offset < batch_buf.len() && parsed_count < NUM_COMMANDS {
-            let buf = parser.read_buf();
-            let n = buf.len().min(batch_buf.len() - offset);
-            buf[..n].copy_from_slice(&batch_buf[offset..offset + n]);
-            parser.did_fill(n);
+            let n = copy_to_spare(&mut parser, &batch_buf[offset..]);
             offset += n;
 
             while let ParseResult::Complete = parser.parse_one() {
@@ -264,10 +271,7 @@ fn bench_pure_resp_parser_throughput() {
       while parsed_count < NUM_COMMANDS {
          let mut offset = 0;
          while offset < batch_buf.len() && parsed_count < NUM_COMMANDS {
-            let buf = parser.read_buf();
-            let n = buf.len().min(batch_buf.len() - offset);
-            buf[..n].copy_from_slice(&batch_buf[offset..offset + n]);
-            parser.did_fill(n);
+            let n = copy_to_spare(&mut parser, &batch_buf[offset..]);
             offset += n;
 
             while let ParseResult::Complete = parser.parse_one() {
@@ -309,10 +313,7 @@ fn bench_pure_resp_parser_throughput() {
       while parsed_count < NUM_COMMANDS {
          let mut offset = 0;
          while offset < batch_buf.len() && parsed_count < NUM_COMMANDS {
-            let buf = parser.read_buf();
-            let n = buf.len().min(batch_buf.len() - offset);
-            buf[..n].copy_from_slice(&batch_buf[offset..offset + n]);
-            parser.did_fill(n);
+            let n = copy_to_spare(&mut parser, &batch_buf[offset..]);
             offset += n;
 
             while let ParseResult::Complete = parser.parse_one() {
@@ -358,10 +359,7 @@ fn bench_pure_resp_parser_throughput() {
                while count < COMMANDS_PER_THREAD {
                   let mut offset = 0;
                   while offset < batch_buf.len() && count < COMMANDS_PER_THREAD {
-                     let buf = parser.read_buf();
-                     let n = buf.len().min(batch_buf.len() - offset);
-                     buf[..n].copy_from_slice(&batch_buf[offset..offset + n]);
-                     parser.did_fill(n);
+                     let n = copy_to_spare(&mut parser, &batch_buf[offset..]);
                      offset += n;
 
                      while let ParseResult::Complete = parser.parse_one() {
@@ -414,10 +412,7 @@ fn bench_pure_resp_parser_throughput() {
                while count < COMMANDS_PER_THREAD {
                   let mut offset = 0;
                   while offset < batch_buf.len() && count < COMMANDS_PER_THREAD {
-                     let buf = parser.read_buf();
-                     let n = buf.len().min(batch_buf.len() - offset);
-                     buf[..n].copy_from_slice(&batch_buf[offset..offset + n]);
-                     parser.did_fill(n);
+                     let n = copy_to_spare(&mut parser, &batch_buf[offset..]);
                      offset += n;
 
                      while let ParseResult::Complete = parser.parse_one() {

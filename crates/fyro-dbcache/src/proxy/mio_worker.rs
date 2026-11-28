@@ -4,7 +4,7 @@
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -56,17 +56,19 @@ impl ReadBuf {
          if self.buf.capacity() - start < 65536 {
             self.buf.reserve(65536);
          }
-         let spare = self.buf.spare_capacity_mut();
-         let slice =
-            unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
-         match stream.read(slice) {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof")),
-            Ok(n) => unsafe {
-               self.buf.set_len(start + n);
-            },
+         let n = match stream
+            .try_io(|| socket2::SockRef::from(&*stream).recv(self.buf.spare_capacity_mut()))
+         {
+            Ok(n) => n,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(e) => return Err(e),
+         };
+         if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
          }
+         // SAFETY: `recv` initializes the first `n` bytes of the spare capacity,
+         // and its return value cannot exceed the provided slice's length.
+         unsafe { self.buf.set_len(start + n) };
       }
    }
 
@@ -94,8 +96,7 @@ impl ReadBuf {
 
    fn compact(&mut self) {
       if self.consumed > 4096 && self.consumed >= self.buf.len() / 2 {
-         self.buf.drain(..self.consumed);
-         self.consumed = 0;
+         self.buf.drain(..std::mem::replace(&mut self.consumed, 0));
       }
    }
 }
@@ -1132,7 +1133,7 @@ fn handle_startup_event(conn: &mut ProxyConn, shared: &WorkerShared) -> Next {
       if frame.len() < 8 {
          return Next::Close;
       }
-      let code = i32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]);
+      let code = i32::from_be_bytes(frame[4..].try_into().unwrap());
 
       if code == protocol::SSL_REQUEST_CODE || code == protocol::GSSENC_REQUEST_CODE {
          conn.wbuf.extend(b"N");
@@ -1417,4 +1418,95 @@ fn alloc_slot(
       conns.resize_with(id + 1, || None);
    }
    id
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+   use std::net::{Shutdown, TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+   use std::time::Duration;
+
+   fn connected_stream() -> (TcpStream, StdTcpStream) {
+      let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+      let client = StdTcpStream::connect(listener.local_addr().unwrap()).unwrap();
+      let (peer, _) = listener.accept().unwrap();
+      client.set_nonblocking(true).unwrap();
+      (TcpStream::from_std(client), peer)
+   }
+
+   fn register_readable(poll: &Poll, stream: &mut TcpStream) {
+      poll
+         .registry()
+         .register(stream, Token(1), Interest::READABLE)
+         .unwrap();
+   }
+
+   fn wait_readable(poll: &mut Poll, events: &mut Events) {
+      events.clear();
+      poll.poll(events, Some(Duration::from_secs(2))).unwrap();
+      assert!(
+         events
+            .iter()
+            .any(|event| event.token() == Token(1) && event.is_readable()),
+         "socket did not become readable before the timeout"
+      );
+   }
+
+   #[test]
+   fn repeated_reads_rearm_readiness_after_would_block() {
+      let mut poll = Poll::new().unwrap();
+      let (mut stream, mut peer) = connected_stream();
+      register_readable(&poll, &mut stream);
+      let mut events = Events::with_capacity(8);
+      let mut read_buf = ReadBuf::new();
+
+      peer.write_all(b"first").unwrap();
+      wait_readable(&mut poll, &mut events);
+      read_buf.fill(&mut stream).unwrap();
+      assert_eq!(read_buf.buf, b"first");
+      assert!(read_buf.buf.len() < read_buf.buf.capacity());
+
+      peer.write_all(b"second").unwrap();
+      wait_readable(&mut poll, &mut events);
+      read_buf.fill(&mut stream).unwrap();
+      assert_eq!(read_buf.buf, b"firstsecond");
+   }
+
+   #[test]
+   fn fill_compacts_consumed_bytes_before_receiving_more() {
+      let mut poll = Poll::new().unwrap();
+      let (mut stream, mut peer) = connected_stream();
+      register_readable(&poll, &mut stream);
+      let mut events = Events::with_capacity(8);
+      let mut read_buf = ReadBuf::new();
+      let payload = vec![b'x'; 40_000];
+
+      peer.write_all(&payload).unwrap();
+      wait_readable(&mut poll, &mut events);
+      read_buf.fill(&mut stream).unwrap();
+      read_buf.consumed = 20_001;
+      peer.write_all(b"tail").unwrap();
+      wait_readable(&mut poll, &mut events);
+      read_buf.fill(&mut stream).unwrap();
+
+      assert_eq!(read_buf.consumed, 0);
+      assert_eq!(read_buf.available(), [&payload[20_001..], b"tail"].concat());
+   }
+
+   #[test]
+   fn fill_keeps_received_bytes_when_peer_closes() {
+      let mut poll = Poll::new().unwrap();
+      let (mut stream, mut peer) = connected_stream();
+      register_readable(&poll, &mut stream);
+      let mut events = Events::with_capacity(8);
+      let mut read_buf = ReadBuf::new();
+
+      peer.write_all(b"before-eof").unwrap();
+      peer.shutdown(Shutdown::Write).unwrap();
+      wait_readable(&mut poll, &mut events);
+      let error = read_buf.fill(&mut stream).unwrap_err();
+
+      assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+      assert_eq!(read_buf.buf, b"before-eof");
+   }
 }
