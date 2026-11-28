@@ -113,7 +113,7 @@ impl<R: Read> FrameReader<R> {
       if self.frame.capacity() > 256 * 1024 && total <= 8192 {
          self.small_frames += 1;
          if self.small_frames == 64 {
-            self.frame = Vec::with_capacity(8192);
+            self.frame.shrink_to(8192);
             self.small_frames = 0;
          }
       } else {
@@ -138,7 +138,7 @@ impl<R: Read> FrameReader<R> {
       let mut header = [0u8; 5];
       self.inner.read_exact(&mut header)?;
       let tag = header[0];
-      let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+      let len = i32::from_be_bytes(header[1..].try_into().unwrap());
       if len < 4 || len as usize > MAX_MESSAGE_LEN {
          return Err(invalid("invalid message length"));
       }
@@ -705,6 +705,29 @@ pub fn write_fatal_response<W: Write>(writer: &mut W, code: &str, message: &str)
 #[cfg(test)]
 mod buffer_tests {
    use super::*;
+
+   #[test]
+   fn read_raw_keeps_successful_frame_bytes() {
+      let mut wire = b"d".to_vec();
+      wire.extend_from_slice(&7i32.to_be_bytes());
+      wire.extend_from_slice(b"xyz");
+      let mut reader = FrameReader::new(&wire[..]);
+
+      assert_eq!(reader.read_raw().unwrap(), b'd');
+      assert_eq!(reader.last_frame(), wire);
+      assert_eq!(reader.last_body(), b"xyz");
+   }
+
+   #[test]
+   fn read_raw_reports_truncated_frame_body() {
+      let wire = b"d\0\0\0\x06x";
+      let mut reader = FrameReader::new(&wire[..]);
+
+      assert_eq!(
+         reader.read_raw().unwrap_err().kind(),
+         io::ErrorKind::UnexpectedEof
+      );
+   }
 
    #[test]
    fn small_traffic_releases_a_large_frame_after_a_grace_period() {
